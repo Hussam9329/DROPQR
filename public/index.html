@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DropQR — Share files that expire</title>
+  <meta name="description" content="Upload a file, get a link and QR code. Set how long it lives and how many times it can be downloaded. No sign-up.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><path d='M9 9h5v5H9zM18 9h5v5h-5zM9 18h5v5H9zM18 18h2v2h-2zM21 21h2v2h-2z' fill='white'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="/">
+      <span class="brand-mark">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h3v3h-3zM18 18h3v3h-3zM14 18h3v3h-3zM18 14h3v3h-3z"/></svg>
+      </span>
+      DropQR
+    </a>
+    <nav class="nav-links">
+      <a href="#how">How it works</a>
+      <a href="#recent">Your links</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <span class="pill">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        No account needed · Auto-deletes
+      </span>
+      <h1>Share files with a link<br>that <span>expires on its own</span></h1>
+      <p>Upload a file, get a short link and a QR code. You decide how long it lives and how many times it can be downloaded.</p>
+    </section>
+
+    <section class="card uploader">
+      <!-- Upload form -->
+      <form id="form" novalidate>
+        <label class="dropzone" id="dropzone">
+          <input type="file" id="file">
+          <div class="icon">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
+          </div>
+          <strong>Drop a file here or click to browse</strong>
+          <small id="limit-text">Any file type</small>
+        </label>
+
+        <div class="file-chip" id="chip">
+          <div class="ficon" id="chip-ext">FILE</div>
+          <div class="meta">
+            <div class="name" id="chip-name"></div>
+            <div class="size" id="chip-size"></div>
+          </div>
+          <button type="button" class="icon-btn" id="chip-remove" aria-label="Remove file">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+
+        <div class="field">
+          <div class="field-label">Delete after <span id="expiry-hint"></span></div>
+          <div class="chips" id="expiry" role="group" aria-label="Expiry time"></div>
+        </div>
+
+        <div class="field">
+          <div class="field-label">Download limit <span id="dl-hint"></span></div>
+          <div class="chips" id="downloads" role="group" aria-label="Download limit"></div>
+        </div>
+
+        <button class="btn btn-primary" id="submit" type="submit" disabled>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+          Upload &amp; create link
+        </button>
+
+        <div class="progress" id="progress">
+          <div class="bar"><div id="bar"></div></div>
+          <div class="progress-text"><span id="progress-label">Uploading…</span><span id="progress-pct">0%</span></div>
+        </div>
+        <div class="error" id="error" role="alert"></div>
+      </form>
+
+      <!-- Result -->
+      <div class="result" id="result">
+        <div class="result-head">
+          <div class="check"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></div>
+          <div>
+            <h2>Your link is ready</h2>
+            <p id="result-name"></p>
+          </div>
+        </div>
+
+        <div class="share-grid">
+          <div class="qr" id="qr"></div>
+          <div>
+            <div class="link-box">
+              <input id="link" readonly aria-label="Share link">
+              <button class="btn btn-ghost" id="copy" type="button">Copy</button>
+            </div>
+            <div class="stats">
+              <div class="stat"><small>Expires in</small><b id="r-expires">—</b></div>
+              <div class="stat"><small>Downloads left</small><b id="r-left">—</b></div>
+            </div>
+            <div class="row-actions">
+              <button class="btn btn-ghost" id="share" type="button" hidden>Share…</button>
+              <a class="btn btn-ghost" id="qr-dl" download="dropqr-code.png">Save QR</a>
+              <button class="btn btn-danger" id="delete" type="button">Delete now</button>
+            </div>
+          </div>
+        </div>
+
+        <button class="btn btn-primary" id="again" type="button">Upload another file</button>
+      </div>
+    </section>
+
+    <section class="features" id="how">
+      <div class="card feature">
+        <div class="ficon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
+        <h3>Timed links</h3>
+        <p>Pick 5 minutes up to 7 days. When time is up, the file is deleted from the server.</p>
+      </div>
+      <div class="card feature">
+        <div class="ficon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></div>
+        <h3>Download limit</h3>
+        <p>Allow 1, 4, or up to 100 downloads. After the last one, the link stops working.</p>
+      </div>
+      <div class="card feature">
+        <div class="ficon"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h3v3h-3zM18 18h3v3h-3z"/></svg></div>
+        <h3>QR code</h3>
+        <p>Every link comes with a QR code. Scan it with a phone camera to download straight away.</p>
+      </div>
+    </section>
+
+    <section id="recent" style="margin-top:56px; display:none">
+      <h2 style="font-size:20px; margin:0 0 14px">Your recent links <small style="color:var(--muted); font-weight:500; font-size:13px">(saved in this browser only)</small></h2>
+      <div class="card" style="padding:8px 0" id="recent-list"></div>
+    </section>
+  </main>
+
+  <footer>DropQR · Files are deleted automatically when they expire or run out of downloads.</footer>
+  <div class="toast" id="toast"></div>
+  <script src="/common.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

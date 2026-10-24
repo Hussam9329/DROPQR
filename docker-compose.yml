@@ -1,0 +1,30 @@
+# For a VPS: runs DropQR behind Caddy, which gets a free HTTPS certificate automatically.
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      BASE_URL: https://${DOMAIN}
+      MAX_FILE_MB: ${MAX_FILE_MB:-500}
+    volumes:
+      - dropqr-data:/app/data
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+
+volumes:
+  dropqr-data:
+  caddy-data:
+  caddy-config:

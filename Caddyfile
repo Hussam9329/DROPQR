@@ -1,0 +1,7 @@
+{$DOMAIN} {
+	encode gzip
+	request_body {
+		max_size 2GB
+	}
+	reverse_proxy app:3000
+}
