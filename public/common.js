@@ -31,6 +31,11 @@ function toast(msg) {
   toast._t = setTimeout(() => t.classList.remove('show'), 1800);
 }
 
+// Server time minus this device's time, so countdowns stay right even if the device clock is off.
+let clockOffset = 0;
+function syncClock(meta) { if (meta && meta.serverNow) clockOffset = meta.serverNow - Date.now(); }
+const nowMs = () => Date.now() + clockOffset;
+
 const store = {
   get() { try { return JSON.parse(localStorage.getItem('dropqr:links') || '[]'); } catch { return []; } },
   set(list) { try { localStorage.setItem('dropqr:links', JSON.stringify(list.slice(0, 20))); } catch {} },

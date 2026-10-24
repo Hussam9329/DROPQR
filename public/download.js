@@ -44,7 +44,7 @@ function render() {
 }
 
 function tick() {
-  const ms = meta.expiresAt - Date.now();
+  const ms = meta.expiresAt - nowMs();
   if (ms <= 0) return showGone('This link has expired', 'The file was deleted when its time ran out.');
   $('#left').textContent = formatLeft(ms);
 }
@@ -55,6 +55,7 @@ async function load() {
     if (r.status === 404) return showGone('Link not found', 'This link does not exist, or the file was already deleted.');
     if (!r.ok) return showGone('This link has expired', 'It ran out of time or reached its download limit.');
     const fresh = await r.json();
+    syncClock(fresh);
     const first = !meta;
     meta = fresh;
     if (first) render();

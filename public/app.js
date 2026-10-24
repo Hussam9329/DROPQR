@@ -69,54 +69,63 @@ window.addEventListener('dragover', (e) => e.preventDefault());
 window.addEventListener('drop', (e) => { e.preventDefault(); if (!state.current && e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
 
 // ---------- Upload ----------
-$('#form').addEventListener('submit', (e) => {
+// 1) reserve a slot  2) upload straight to Blob storage  3) confirm and get the link
+async function api(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || 'Upload failed. Please try again.');
+  return data;
+}
+
+function setProgress(pct, label) {
+  $('#bar').style.width = pct + '%';
+  $('#progress-pct').textContent = Math.round(pct) + '%';
+  if (label) $('#progress-label').textContent = label;
+}
+
+$('#form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  if (!state.file) return;
-
-  const fd = new FormData();
-  fd.append('expiry', state.expiry);
-  fd.append('maxDownloads', String(state.downloads));
-  fd.append('file', state.file);
-
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/upload');
-  xhr.responseType = 'json';
+  const file = state.file;
+  if (!file) return;
 
   $('#submit').disabled = true;
   $('#error').textContent = '';
   $('#progress').classList.add('show');
-  $('#progress-label').textContent = 'Uploading…';
+  setProgress(0, 'Preparing…');
 
-  xhr.upload.onprogress = (ev) => {
-    if (!ev.lengthComputable) return;
-    const pct = Math.round((ev.loaded / ev.total) * 100);
-    $('#bar').style.width = pct + '%';
-    $('#progress-pct').textContent = pct + '%';
-    if (pct === 100) $('#progress-label').textContent = 'Finishing…';
-  };
-  xhr.onload = () => {
-    $('#progress').classList.remove('show');
-    $('#bar').style.width = '0';
-    const data = xhr.response || {};
-    if (xhr.status !== 201) {
-      $('#error').textContent = data.error || 'Upload failed. Please try again.';
-      $('#submit').disabled = false;
-      return;
-    }
+  try {
+    const slot = await api('/api/uploads', {
+      name: file.name, size: file.size, type: file.type,
+      expiry: state.expiry, maxDownloads: state.downloads,
+    });
+
+    setProgress(0, 'Uploading…');
+    await window.blobUpload(slot.pathname, file, {
+      access: 'private',
+      handleUploadUrl: '/api/blob-upload',
+      clientPayload: slot.id,
+      contentType: file.type || undefined,
+      multipart: file.size > 50 * 1024 * 1024,
+      onUploadProgress: (p) => setProgress(p.percentage, p.percentage >= 100 ? 'Finishing…' : 'Uploading…'),
+    });
+
+    setProgress(100, 'Finishing…');
+    const data = await api(`/api/uploads/${slot.id}/complete`, { deleteToken: slot.deleteToken });
     store.set([{ id: data.id, name: data.name, url: data.url, deleteToken: data.deleteToken, expiresAt: data.expiresAt }, ...store.get()]);
     showResult(data);
     renderRecent();
-  };
-  xhr.onerror = () => {
-    $('#progress').classList.remove('show');
-    $('#error').textContent = 'Network error. Check your connection and try again.';
+  } catch (err) {
+    $('#error').textContent = err.message || 'Upload failed. Please try again.';
     $('#submit').disabled = false;
-  };
-  xhr.send(fd);
+  } finally {
+    $('#progress').classList.remove('show');
+    setProgress(0);
+  }
 });
 
 // ---------- Result ----------
 function showResult(data) {
+  syncClock(data);
   state.current = data;
   $('#form').style.display = 'none';
   $('#result').classList.add('show');
@@ -134,7 +143,7 @@ function showResult(data) {
 
 function tick() {
   if (!state.current) return;
-  $('#r-expires').textContent = formatLeft(state.current.expiresAt - Date.now());
+  $('#r-expires').textContent = formatLeft(state.current.expiresAt - nowMs());
 }
 
 // Refresh the download count every few seconds while the result is open.
@@ -146,6 +155,7 @@ async function pollStats() {
     if (state.current !== cur) return;
     if (r.ok) {
       const m = await r.json();
+      syncClock(m);
       $('#r-left').textContent = `${m.remaining} of ${m.maxDownloads}`;
     } else {
       $('#r-left').textContent = '0 — link expired';
@@ -190,7 +200,7 @@ async function deleteLink(id, token) {
 
 // ---------- Recent links (this browser only) ----------
 async function renderRecent() {
-  const list = store.get().filter((x) => x.expiresAt > Date.now());
+  const list = store.get().filter((x) => x.expiresAt > nowMs());
   store.set(list);
   const box = $('#recent-list');
   $('#recent').style.display = list.length ? '' : 'none';
@@ -217,7 +227,8 @@ async function renderRecent() {
       const s = row.querySelector('.s');
       if (!r.ok) { s.textContent = 'Expired'; return; }
       const m = await r.json();
-      s.textContent = `${m.downloads}/${m.maxDownloads} downloads · expires in ${formatLeft(m.expiresAt - Date.now())}`;
+      syncClock(m);
+      s.textContent = `${m.downloads}/${m.maxDownloads} downloads · expires in ${formatLeft(m.expiresAt - nowMs())}`;
     }).catch(() => {});
   }
   if (box.lastElementChild) box.lastElementChild.style.borderBottom = '0';

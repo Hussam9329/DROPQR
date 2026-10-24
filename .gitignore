@@ -1,3 +1,11 @@
 node_modules/
 data/
-.env
+.vercel
+.env*
+!.env.example
+# Agent tooling added by the Neon integration
+.agents/
+.claude/
+skills-lock.json
+
+.env*

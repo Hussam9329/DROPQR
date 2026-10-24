@@ -1,22 +1,23 @@
 'use strict';
 
 const express = require('express');
-const multer = require('multer');
 const QRCode = require('qrcode');
 const rateLimit = require('express-rate-limit');
-const { DatabaseSync } = require('node:sqlite');
+const { neon } = require('@neondatabase/serverless');
+const { head, del, get } = require('@vercel/blob');
+const { handleUpload } = require('@vercel/blob/client');
 const crypto = require('node:crypto');
-const fs = require('node:fs');
-const os = require('node:os');
+const { Readable, pipeline } = require('node:stream');
 const path = require('node:path');
 
 // ---------- Config ----------
 const PORT = Number(process.env.PORT) || 3000;
 const BASE_URL = (process.env.BASE_URL || '').replace(/\/+$/, '');
-const MAX_FILE_MB = Number(process.env.MAX_FILE_MB) || 500;
-const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
-const UPLOAD_DIR = path.join(DATA_DIR, 'files');
-const CLEANUP_EVERY_MS = 30 * 1000;
+// Downloads stream through a Vercel Function (max 300 s), so keep files moderate.
+const MAX_FILE_MB = Number(process.env.MAX_FILE_MB) || 100;
+const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
+const EXHAUSTED_GRACE_MS = 10 * 60 * 1000; // keep a used-up file this long so the last download can finish
+const PENDING_TTL_MS = 2 * 60 * 60 * 1000; // uploads never finished are dropped after this
 
 // Allowed lifetimes (key -> seconds). The client may only pick from these.
 const EXPIRY_OPTIONS = {
@@ -32,105 +33,98 @@ const EXPIRY_OPTIONS = {
 };
 const DOWNLOAD_OPTIONS = [1, 2, 3, 4, 5, 10, 25, 50, 100];
 
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// ---------- Database (Neon) ----------
+const sql = neon(process.env.DATABASE_URL);
+const query = (text, params = []) => sql.query(text, params);
 
-// ---------- Database ----------
-const db = new DatabaseSync(path.join(DATA_DIR, 'dropqr.db'));
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  CREATE TABLE IF NOT EXISTS files (
-    id             TEXT PRIMARY KEY,
-    stored_name    TEXT NOT NULL,
-    original_name  TEXT NOT NULL,
-    mime           TEXT NOT NULL,
-    size           INTEGER NOT NULL,
-    created_at     INTEGER NOT NULL,
-    expires_at     INTEGER NOT NULL,
-    max_downloads  INTEGER NOT NULL,
-    downloads      INTEGER NOT NULL DEFAULT 0,
-    delete_token   TEXT NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_files_expires ON files(expires_at);
-`);
+// Created once per server instance.
+let schemaReady;
+function ensureSchema() {
+  schemaReady ??= (async () => {
+    await query(`CREATE TABLE IF NOT EXISTS files (
+      id                TEXT PRIMARY KEY,
+      pathname          TEXT NOT NULL UNIQUE,
+      original_name     TEXT NOT NULL,
+      mime              TEXT NOT NULL,
+      size              BIGINT NOT NULL,
+      status            TEXT NOT NULL DEFAULT 'pending',
+      expiry_seconds    INTEGER NOT NULL,
+      max_downloads     INTEGER NOT NULL,
+      downloads         INTEGER NOT NULL DEFAULT 0,
+      delete_token      TEXT NOT NULL,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at        TIMESTAMPTZ,
+      last_download_at  TIMESTAMPTZ
+    )`);
+    await query('CREATE INDEX IF NOT EXISTS idx_files_status_expires ON files (status, expires_at)');
+  })().catch((err) => { schemaReady = null; throw err; });
+  return schemaReady;
+}
 
-const q = {
-  insert: db.prepare(`INSERT INTO files
-    (id, stored_name, original_name, mime, size, created_at, expires_at, max_downloads, delete_token)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-  get: db.prepare('SELECT * FROM files WHERE id = ?'),
-  // Atomically claim one download slot; returns the row only if a slot was available.
-  claim: db.prepare(`UPDATE files SET downloads = downloads + 1
-    WHERE id = ? AND downloads < max_downloads AND expires_at > ?
-    RETURNING *`),
-  release: db.prepare('UPDATE files SET downloads = downloads - 1 WHERE id = ? AND downloads > 0'),
-  remove: db.prepare('DELETE FROM files WHERE id = ?'),
-  expired: db.prepare('SELECT id, stored_name FROM files WHERE expires_at <= ? OR downloads >= max_downloads'),
-};
-
-const now = () => Date.now();
-const newId = () => crypto.randomBytes(6).toString('base64url'); // 8 chars, ~48 bits
+const newId = () => crypto.randomBytes(6).toString('base64url'); // 8 chars
 const newToken = () => crypto.randomBytes(24).toString('base64url');
 
-// Files currently being streamed: stored_name -> number of open downloads.
-// Deleting the DB row stops new access at once; the file on disk is removed
-// only after every running download for it has finished.
-const streaming = new Map();
-const pendingUnlink = new Set();
-
-function unlinkStored(storedName) {
-  if (streaming.get(storedName)) { pendingUnlink.add(storedName); return; }
-  pendingUnlink.delete(storedName);
-  fs.rm(path.join(UPLOAD_DIR, storedName), { force: true }, () => {});
-}
-
-function deleteFile(row) {
-  q.remove.run(row.id);
-  unlinkStored(row.stored_name);
-}
-
-function isActive(row) {
-  return row && row.expires_at > now() && row.downloads < row.max_downloads;
+function safeFileName(name) {
+  const clean = String(name || 'file').replace(/[\\/\u0000-\u001f]/g, '_').trim().slice(0, 200);
+  return clean || 'file';
 }
 
 function publicMeta(row) {
   return {
     id: row.id,
     name: row.original_name,
-    size: row.size,
+    size: Number(row.size),
     mime: row.mime,
-    createdAt: row.created_at,
-    expiresAt: row.expires_at,
+    createdAt: new Date(row.created_at).getTime(),
+    expiresAt: new Date(row.expires_at).getTime(),
     maxDownloads: row.max_downloads,
     downloads: row.downloads,
     remaining: Math.max(0, row.max_downloads - row.downloads),
+    serverNow: Date.now(),
   };
 }
 
-// Pick the address used inside share links / QR codes.
-// On localhost we swap in the LAN IP so a phone on the same Wi-Fi can scan it.
-function lanIp() {
-  for (const list of Object.values(os.networkInterfaces())) {
-    for (const ni of list || []) {
-      if (ni.family === 'IPv4' && !ni.internal) return ni.address;
-    }
-  }
-  return null;
+function isActive(row) {
+  return row && row.status === 'ready' && new Date(row.expires_at).getTime() > Date.now()
+    && row.downloads < row.max_downloads;
 }
+
 function baseUrlFor(req) {
   if (BASE_URL) return BASE_URL;
-  const host = req.get('host') || `localhost:${PORT}`;
-  const [hostname, port] = host.split(':');
-  if (['localhost', '127.0.0.1', '[::1]'].includes(hostname)) {
-    const ip = lanIp();
-    if (ip) return `${req.protocol}://${ip}${port ? ':' + port : ''}`;
-  }
-  return `${req.protocol}://${host}`;
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+async function removeFile(row) {
+  await query('DELETE FROM files WHERE id = $1', [row.id]);
+  await del(row.pathname).catch(() => {}); // already gone is fine
+}
+
+// Deletes expired, used-up and abandoned files. Runs from the daily cron
+// and, at most once a minute, alongside normal traffic.
+let lastCleanup = 0;
+async function cleanup() {
+  lastCleanup = Date.now();
+  const rows = await query(`SELECT id, pathname FROM files
+    WHERE (status = 'ready' AND expires_at <= now())
+       OR (status = 'ready' AND downloads >= max_downloads
+           AND (last_download_at IS NULL OR last_download_at <= now() - make_interval(secs => $1)))
+       OR (status = 'pending' AND created_at <= now() - make_interval(secs => $2))
+    LIMIT 500`, [EXHAUSTED_GRACE_MS / 1000, PENDING_TTL_MS / 1000]);
+  if (!rows.length) return 0;
+  // Keep the rows if storage deletion fails, so the next run retries them.
+  await del(rows.map((r) => r.pathname));
+  await query('DELETE FROM files WHERE id = ANY($1)', [rows.map((r) => r.id)]);
+  return rows.length;
+}
+function cleanupSoon() {
+  if (Date.now() - lastCleanup > 60 * 1000) cleanup().catch((e) => console.error('cleanup failed', e));
 }
 
 // ---------- App ----------
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
+app.use(express.json({ limit: '64kb' }));
 
 app.use((req, res, next) => {
   res.set({
@@ -141,143 +135,169 @@ app.use((req, res, next) => {
   next();
 });
 
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: UPLOAD_DIR,
-    filename: (_req, _file, cb) => cb(null, crypto.randomBytes(16).toString('hex')),
-  }),
-  limits: { fileSize: MAX_FILE_MB * 1024 * 1024, files: 1 },
+app.use('/api', async (_req, _res, next) => {
+  try { await ensureSchema(); next(); } catch (err) { next(err); }
 });
 
 const uploadLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 const apiLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
 
-// Used by Railway / Docker to know the app is alive.
-app.get('/healthz', (_req, res) => {
-  db.prepare('SELECT 1').get();
-  res.json({ ok: true });
-});
+// Wraps async handlers so errors reach the error handler.
+const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 app.get('/api/config', (_req, res) => {
   res.json({ expiryOptions: Object.keys(EXPIRY_OPTIONS), downloadOptions: DOWNLOAD_OPTIONS, maxFileMb: MAX_FILE_MB });
 });
 
-app.post('/api/upload', uploadLimiter, (req, res) => {
-  upload.single('file')(req, res, async (err) => {
-    if (err) {
-      const msg = err.code === 'LIMIT_FILE_SIZE' ? `File is larger than ${MAX_FILE_MB} MB.` : 'Upload failed.';
-      return res.status(400).json({ error: msg });
-    }
-    if (!req.file) return res.status(400).json({ error: 'No file received.' });
+app.get('/api/health', h(async (_req, res) => {
+  await query('SELECT 1');
+  res.json({ ok: true });
+}));
 
-    const seconds = EXPIRY_OPTIONS[req.body.expiry];
-    const maxDownloads = Number(req.body.maxDownloads);
-    if (!seconds || !DOWNLOAD_OPTIONS.includes(maxDownloads)) {
-      fs.rm(req.file.path, { force: true }, () => {});
-      return res.status(400).json({ error: 'Invalid expiry or download limit.' });
-    }
+// Step 1: reserve an id and a storage path for the file.
+app.post('/api/uploads', uploadLimiter, h(async (req, res) => {
+  const { name, size, type, expiry, maxDownloads } = req.body || {};
+  const seconds = EXPIRY_OPTIONS[expiry];
+  const max = Number(maxDownloads);
+  const bytes = Number(size);
+  if (!seconds || !DOWNLOAD_OPTIONS.includes(max)) return res.status(400).json({ error: 'Invalid expiry or download limit.' });
+  if (!Number.isFinite(bytes) || bytes <= 0) return res.status(400).json({ error: 'Empty files cannot be shared.' });
+  if (bytes > MAX_FILE_BYTES) return res.status(400).json({ error: `File is larger than ${MAX_FILE_MB} MB.` });
 
-    // multer decodes the filename as latin1; restore UTF-8 (Arabic names etc.)
-    const originalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8').slice(0, 255);
-    const id = newId();
-    const deleteToken = newToken();
-    const createdAt = now();
-    const expiresAt = createdAt + seconds * 1000;
+  const id = newId();
+  const fileName = safeFileName(name);
+  const pathname = `f/${id}/${fileName}`;
+  const deleteToken = newToken();
+  await query(`INSERT INTO files (id, pathname, original_name, mime, size, expiry_seconds, max_downloads, delete_token)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+  [id, pathname, fileName, String(type || 'application/octet-stream').slice(0, 200), bytes, seconds, max, deleteToken]);
 
-    q.insert.run(id, req.file.filename, originalName, req.file.mimetype || 'application/octet-stream',
-      req.file.size, createdAt, expiresAt, maxDownloads, deleteToken);
+  cleanupSoon();
+  res.status(201).json({ id, pathname, deleteToken });
+}));
 
-    const url = `${baseUrlFor(req)}/f/${id}`;
-    const qrOpts = { errorCorrectionLevel: 'M', margin: 1, color: { dark: '#0b1020', light: '#ffffff' } };
-    const [qrSvg, qrPng] = await Promise.all([
-      QRCode.toString(url, { ...qrOpts, type: 'svg' }),
-      QRCode.toDataURL(url, { ...qrOpts, width: 600 }),
-    ]);
-
-    res.status(201).json({ ...publicMeta(q.get.get(id)), url, qrSvg, qrPng, deleteToken });
-  });
-});
-
-app.get('/api/files/:id', apiLimiter, (req, res) => {
-  const row = q.get.get(req.params.id);
-  if (!row) return res.status(404).json({ error: 'This link does not exist or was removed.' });
-  if (!isActive(row)) {
-    deleteFile(row);
-    return res.status(410).json({ error: 'This link has expired.' });
+// Step 2: the browser asks for a one-time token and uploads straight to Blob storage.
+app.post('/api/blob-upload', h(async (req, res) => {
+  try {
+    const result = await handleUpload({
+      body: req.body,
+      request: req,
+      onBeforeGenerateToken: async (pathname, clientPayload) => {
+        const [row] = await query("SELECT * FROM files WHERE id = $1 AND status = 'pending'", [clientPayload]);
+        if (!row || row.pathname !== pathname) throw new Error('Upload not allowed.');
+        return {
+          maximumSizeInBytes: Number(row.size),
+          addRandomSuffix: false,
+          allowOverwrite: false,
+          validUntil: Date.now() + 60 * 60 * 1000,
+        };
+      },
+      // Finalising happens in /complete, so nothing is needed here.
+      onUploadCompleted: async () => {},
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message || 'Upload failed.' });
   }
-  res.json(publicMeta(row));
-});
+}));
 
-app.delete('/api/files/:id', apiLimiter, (req, res) => {
-  const row = q.get.get(req.params.id);
-  const token = req.get('x-delete-token') || '';
+// Step 3: confirm the file landed, start its timer, and return the link + QR code.
+app.post('/api/uploads/:id/complete', h(async (req, res) => {
+  const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
+  if (!row || row.delete_token !== String(req.body?.deleteToken || '')) return res.status(404).json({ error: 'Upload not found.' });
+  if (row.status !== 'pending') return res.status(409).json({ error: 'Upload already finished.' });
+
+  const blob = await head(row.pathname).catch(() => null);
+  if (!blob) return res.status(400).json({ error: 'The file did not finish uploading. Please try again.' });
+
+  const [ready] = await query(`UPDATE files SET status = 'ready', size = $2, mime = $3,
+      created_at = now(), expires_at = now() + make_interval(secs => expiry_seconds)
+    WHERE id = $1 AND status = 'pending' RETURNING *`, [row.id, blob.size, blob.contentType || row.mime]);
+  if (!ready) return res.status(409).json({ error: 'Upload already finished.' });
+
+  const url = `${baseUrlFor(req)}/f/${ready.id}`;
+  const qrOpts = { errorCorrectionLevel: 'M', margin: 1, color: { dark: '#0b1020', light: '#ffffff' } };
+  const [qrSvg, qrPng] = await Promise.all([
+    QRCode.toString(url, { ...qrOpts, type: 'svg' }),
+    QRCode.toDataURL(url, { ...qrOpts, width: 600 }),
+  ]);
+  res.json({ ...publicMeta(ready), url, qrSvg, qrPng, deleteToken: ready.delete_token });
+}));
+
+app.get('/api/files/:id', apiLimiter, h(async (req, res) => {
+  const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
+  if (!row || row.status !== 'ready') return res.status(404).json({ error: 'This link does not exist or was removed.' });
+  if (!isActive(row)) return res.status(410).json({ error: 'This link has expired.' });
+  res.json(publicMeta(row));
+}));
+
+app.delete('/api/files/:id', apiLimiter, h(async (req, res) => {
+  const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
   if (!row) return res.status(404).json({ error: 'Not found.' });
-  const a = Buffer.from(token);
+  const a = Buffer.from(req.get('x-delete-token') || '');
   const b = Buffer.from(row.delete_token);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(403).json({ error: 'Not allowed.' });
-  deleteFile(row);
+  await removeFile(row);
   res.json({ ok: true });
-});
+}));
 
-// The actual download. Only this route consumes a download slot,
-// so link previews / opening the share page do not use one up.
-app.get('/d/:id', apiLimiter, (req, res) => {
-  const row = q.claim.get(req.params.id, now());
-  if (!row) {
-    const existing = q.get.get(req.params.id);
-    if (existing) deleteFile(existing);
-    return res.redirect(303, `/f/${encodeURIComponent(req.params.id)}`);
+// The actual download. Only this route uses up a download, so opening the
+// share page or a chat-app link preview does not count.
+app.get('/d/:id', apiLimiter, h(async (req, res) => {
+  await ensureSchema();
+  const [row] = await query(`UPDATE files SET downloads = downloads + 1, last_download_at = now()
+    WHERE id = $1 AND status = 'ready' AND downloads < max_downloads AND expires_at > now()
+    RETURNING *`, [req.params.id]);
+  if (!row) return res.redirect(303, `/f/${encodeURIComponent(req.params.id)}`);
+
+  const file = await get(row.pathname, { access: 'private' }).catch(() => null);
+  if (!file || file.statusCode !== 200) {
+    await query('UPDATE files SET downloads = downloads - 1 WHERE id = $1 AND downloads > 0', [row.id]);
+    return res.status(410).type('text').send('File is no longer available.');
   }
 
-  const filePath = path.join(UPLOAD_DIR, row.stored_name);
-  streaming.set(row.stored_name, (streaming.get(row.stored_name) || 0) + 1);
+  res.set({
+    'Content-Type': file.blob.contentType || 'application/octet-stream',
+    // Size recorded at upload (the streamed response may not report one).
+    'Content-Length': String(row.size),
+    'Content-Disposition': `attachment; filename="${row.original_name.replace(/[^ -~]|"/g, '_')}"; filename*=UTF-8''${encodeURIComponent(row.original_name)}`,
+    'Cache-Control': 'private, no-store',
+  });
+
+  // If the transfer is cut off, give the download back.
   let finished = false;
   res.on('finish', () => { finished = true; });
   res.on('close', () => {
-    streaming.set(row.stored_name, streaming.get(row.stored_name) - 1);
-    if (!finished) q.release.run(row.id); // aborted: give the slot back
-    else if (row.downloads >= row.max_downloads) deleteFile(row); // last download done
-    if (pendingUnlink.has(row.stored_name)) unlinkStored(row.stored_name);
+    if (!finished) query('UPDATE files SET downloads = downloads - 1 WHERE id = $1 AND downloads > 0', [row.id]).catch(() => {});
   });
+  pipeline(Readable.fromWeb(file.stream), res, () => {});
+}));
 
-  res.set('Cache-Control', 'no-store');
-  res.download(filePath, row.original_name, { dotfiles: 'deny' }, (err) => {
-    if (err && !res.headersSent) res.status(410).send('File is no longer available.');
-  });
-});
+// Daily safety-net cleanup (Vercel Cron sends the CRON_SECRET as a bearer token).
+app.get('/api/cron/cleanup', h(async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || req.get('authorization') !== `Bearer ${secret}`) return res.status(401).json({ error: 'Unauthorized' });
+  let total = 0;
+  for (let n; (n = await cleanup()) > 0;) total += n;
+  res.json({ deleted: total });
+}));
 
+// Local development only: on Vercel these are served by the CDN / vercel.json.
 app.get('/f/:id', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'download.html')));
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
-app.use((_req, res) => res.status(404).sendFile(path.join(__dirname, 'public', '404.html')));
+const NOT_FOUND_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Not found — DropQR</title><link rel="stylesheet" href="/styles.css"></head><body><main>
+<section class="card dl" style="margin-top:80px"><h1>Page not found</h1><p class="sub">The page you are looking for does not exist.</p>
+<a class="btn btn-primary" href="/">Go home</a></section></main></body></html>`;
+app.use((_req, res) => res.status(404).type('html').send(NOT_FOUND_PAGE));
 
-// ---------- Cleanup ----------
-function cleanup() {
-  for (const row of q.expired.all(now())) deleteFile(row);
-  // Remove orphan files that have no DB row (e.g. crashed mid-upload).
-  const known = new Set(db.prepare('SELECT stored_name FROM files').all().map((r) => r.stored_name));
-  for (const name of fs.readdirSync(UPLOAD_DIR)) {
-    if (known.has(name) || streaming.get(name)) continue;
-    const p = path.join(UPLOAD_DIR, name);
-    fs.stat(p, (e, st) => { if (!e && now() - st.mtimeMs > 60 * 60 * 1000) fs.rm(p, { force: true }, () => {}); });
-  }
-}
-cleanup();
-setInterval(cleanup, CLEANUP_EVERY_MS).unref();
-
-const server = app.listen(PORT, '0.0.0.0', () => {
-  const ip = lanIp();
-  console.log(`DropQR running:\n  Local:   http://localhost:${PORT}`);
-  if (ip && !BASE_URL) console.log(`  Network: http://${ip}:${PORT}`);
-  if (BASE_URL) console.log(`  Public:  ${BASE_URL}`);
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  if (!res.headersSent) res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });
-// Large uploads on slow connections can take a while; don't cut them off.
-server.requestTimeout = 0;
 
-// Stop cleanly when the host restarts or redeploys the app.
-function shutdown(signal) {
-  console.log(`${signal} received, shutting down…`);
-  server.close(() => { db.close(); process.exit(0); });
-  setTimeout(() => process.exit(0), 10_000).unref();
+module.exports = app;
+
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`DropQR running on http://localhost:${PORT}`));
 }
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
