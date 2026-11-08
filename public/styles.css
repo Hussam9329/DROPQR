@@ -54,11 +54,8 @@ button { font: inherit; cursor: pointer; }
   max-width: 1080px; width: 100%; margin: 0 auto;
   padding: 22px 20px; display: flex; align-items: center; justify-content: space-between;
 }
-.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; color: var(--text); }
-.brand-mark {
-  width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
-  background: linear-gradient(135deg, var(--accent), #06b6d4); color: #fff;
-}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 19px; letter-spacing: -0.01em; color: var(--text); }
+.brand-mark { width: 34px; height: 34px; display: block; flex: none; }
 .nav-links { display: flex; gap: 22px; font-size: 14px; color: var(--muted); }
 .nav-links a { color: var(--muted); }
 .nav-links a:hover { color: var(--text); }

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="DropQR">
+  <defs>
+    <linearGradient id="dq" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#4f3ce8"/>
+      <stop offset="0.5" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#00e5ff"/>
+    </linearGradient>
+  </defs>
+  <!-- Rounded frame (a QR finder square) opened at the top by a drop's tip -->
+  <path fill="url(#dq)" fill-rule="evenodd" d="
+    M22 0 H78 A22 22 0 0 1 100 22 V78 A22 22 0 0 1 78 100 H22 A22 22 0 0 1 0 78 V22 A22 22 0 0 1 22 0 Z
+    M48.9 0 H51.1 Q52.6 12.6 60 15.7 H76 A9.3 9.3 0 0 1 85.3 25 V63.2 A23 23 0 0 1 62.3 86.2 H38.1
+    A23 23 0 0 1 15.1 63.2 V25 A9.3 9.3 0 0 1 24.4 15.7 H40.4 Q47.4 12.6 48.9 0 Z"/>
+  <!-- Centre dot -->
+  <rect x="37.6" y="38.6" width="25" height="25" rx="5" fill="url(#dq)"/>
+</svg>
