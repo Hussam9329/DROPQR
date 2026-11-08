@@ -12,19 +12,8 @@ process.env.CRON_SECRET = 'test-secret';
 process.env.STORAGE_CAP_GB = String(3 / 1024); // 3 MB for the whole site
 process.env.DAILY_UPLOAD_MB = '1'; // 1 MB per visitor per day
 process.env.ADMIN_SECRET = 'admin-pass';
-process.env.TURNSTILE_SITE_KEY = 'site-key';
-process.env.TURNSTILE_SECRET_KEY = 'turnstile-secret';
 process.env.VERCEL = '1'; // visitors are told apart by the x-real-ip header
 
-// Fake Cloudflare Turnstile: only the token "good" passes.
-const realFetch = global.fetch;
-global.fetch = async (url, opts) => {
-  if (String(url).startsWith('https://challenges.cloudflare.com/')) {
-    const ok = opts.body.get('response') === 'good' && opts.body.get('secret') === 'turnstile-secret';
-    return new Response(JSON.stringify({ success: ok }));
-  }
-  return realFetch(url, opts);
-};
 delete process.env.DATABASE_URL;
 
 const pg = new PGlite();
@@ -83,7 +72,7 @@ const json = (method, url, body, headers = {}) => fetch(base() + url, {
 });
 
 async function share({ name = 'note.txt', size = 1000, maxDownloads = 4 } = {}) {
-  const r = await json('POST', '/api/uploads', { name, size, type: 'text/plain', expiry: '1h', maxDownloads, turnstileToken: 'good' });
+  const r = await json('POST', '/api/uploads', { name, size, type: 'text/plain', expiry: '1h', maxDownloads });
   const res = { status: r.status, body: await r.json() };
   if (r.status !== 201) return res;
   blobs.set(res.body.pathname, { size, contentType: 'text/plain' }); // the browser's direct upload
@@ -191,7 +180,7 @@ test('rate limit is shared by all instances', async () => {
   await pg.query('DELETE FROM usage_counters');
   const codes = [];
   for (let i = 0; i < 32; i++) {
-    const r = await json('POST', '/api/uploads', { name: 'x.txt', size: 10, expiry: '5m', maxDownloads: 1, turnstileToken: 'good' });
+    const r = await json('POST', '/api/uploads', { name: 'x.txt', size: 10, expiry: '5m', maxDownloads: 1 });
     codes.push(r.status);
   }
   // 30 allowed in 15 minutes, counted together even though requests alternate between two instances.
@@ -199,18 +188,12 @@ test('rate limit is shared by all instances', async () => {
   assert.deepEqual(codes.slice(30), [429, 429]);
 });
 
-// ---------- Stage 2: Turnstile, reports, admin ----------
+// ---------- Stage 2: reports, admin ----------
 const admin = (method, url) => json(method, url, null, { authorization: 'Bearer admin-pass' });
 const report = (id, ip, reason = 'malware', details = '') => json('POST', `/api/files/${id}/report`, { reason, details }, { 'x-real-ip': ip });
 
-test('uploads need a passed human check', async () => {
-  await pg.query('DELETE FROM usage_counters');
-  const base = { name: 'a.txt', size: 10, expiry: '5m', maxDownloads: 1 };
-  assert.equal((await json('POST', '/api/uploads', base)).status, 403);
-  assert.equal((await json('POST', '/api/uploads', { ...base, turnstileToken: 'bad' })).status, 403);
-  assert.equal((await json('POST', '/api/uploads', { ...base, turnstileToken: 'good' })).status, 201);
+test('config lists the report reasons', async () => {
   const cfg = await (await json('GET', '/api/config')).json();
-  assert.equal(cfg.turnstileSiteKey, 'site-key');
   assert.equal(cfg.reportReasons.malware, 'Malware or virus');
 });
 
@@ -269,4 +252,19 @@ test('blocked files are cleaned up after they expire', async () => {
   await json('GET', '/api/cron/cleanup', null, { authorization: 'Bearer test-secret' });
   assert.equal((await pg.query('SELECT 1 FROM files WHERE id = $1', [body.id])).rows.length, 0);
   assert.equal(blobs.has(body.pathname), false);
+});
+
+test('a saved link can be reopened with its QR code', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const { body } = await share({ name: 'photo.jpg' });
+  const plain = await (await json('GET', `/api/files/${body.id}`)).json();
+  assert.equal(plain.qrSvg, undefined); // normal lookups stay small
+  const r = await json('GET', `/api/files/${body.id}?share=1`);
+  assert.equal(r.status, 200);
+  const d = await r.json();
+  assert.equal(d.name, 'photo.jpg');
+  assert.ok(d.url.endsWith(`/f/${body.id}`));
+  assert.match(d.qrSvg, /^<svg/);
+  assert.match(d.qrPng, /^data:image\/png;base64,/);
+  assert.equal(d.deleteToken, undefined); // never handed out again
 });

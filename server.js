@@ -48,9 +48,6 @@ const REPORT_REASONS = {
   other: 'Something else',
 };
 const ABUSE_EMAIL = process.env.ABUSE_EMAIL || '';
-// Cloudflare Turnstile ("are you human" check) on uploads. Off until both keys are set.
-const TURNSTILE_SITE_KEY = process.env.TURNSTILE_SITE_KEY || '';
-const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
 
 // ---------- Database (Neon) ----------
 const sql = neon(process.env.DATABASE_URL);
@@ -125,6 +122,17 @@ function publicMeta(row) {
   };
 }
 
+// The public link plus its QR code (SVG for the page, PNG for saving).
+async function shareLink(req, id) {
+  const url = `${baseUrlFor(req)}/f/${id}`;
+  const qrOpts = { errorCorrectionLevel: 'M', margin: 1, color: { dark: '#0b1020', light: '#ffffff' } };
+  const [qrSvg, qrPng] = await Promise.all([
+    QRCode.toString(url, { ...qrOpts, type: 'svg' }),
+    QRCode.toDataURL(url, { ...qrOpts, width: 600 }),
+  ]);
+  return { url, qrSvg, qrPng };
+}
+
 function isActive(row) {
   return row && row.status === 'ready' && new Date(row.expires_at).getTime() > Date.now()
     && row.downloads < row.max_downloads;
@@ -179,18 +187,6 @@ function sameSecret(given, expected) {
   const a = Buffer.from(String(given));
   const b = Buffer.from(String(expected));
   return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-async function passedTurnstile(req) {
-  if (!TURNSTILE_SECRET_KEY) return true;
-  const token = String(req.body?.turnstileToken || '');
-  if (!token) return false;
-  const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-    method: 'POST',
-    body: new URLSearchParams({ secret: TURNSTILE_SECRET_KEY, response: token, remoteip: req.get('x-real-ip') || req.ip || '' }),
-  }).catch(() => null);
-  const data = r ? await r.json().catch(() => ({})) : {};
-  return data.success === true;
 }
 
 function limit(bucket, windowSec, max) {
@@ -267,7 +263,6 @@ app.get('/api/config', (_req, res) => {
     maxFileMb: MAX_FILE_MB,
     reportReasons: REPORT_REASONS,
     abuseEmail: ABUSE_EMAIL,
-    turnstileSiteKey: TURNSTILE_SECRET_KEY ? TURNSTILE_SITE_KEY : '',
   });
 });
 
@@ -285,9 +280,6 @@ app.post('/api/uploads', uploadLimiter, h(async (req, res) => {
   if (!seconds || !DOWNLOAD_OPTIONS.includes(max)) return res.status(400).json({ error: 'Invalid expiry or download limit.' });
   if (!Number.isSafeInteger(bytes) || bytes <= 0) return res.status(400).json({ error: 'Empty files cannot be shared.' });
   if (bytes > MAX_FILE_BYTES) return res.status(400).json({ error: `File is larger than ${MAX_FILE_MB} MB.` });
-  if (!(await passedTurnstile(req))) {
-    return res.status(403).json({ error: 'Please complete the human check and try again.' });
-  }
 
   // Unfinished reservations count too, so storage can't be filled by starting many uploads.
   const [{ used }] = await query("SELECT COALESCE(SUM(size), 0) AS used FROM files WHERE status IN ('pending', 'ready')");
@@ -351,15 +343,11 @@ app.post('/api/uploads/:id/complete', completeLimiter, h(async (req, res) => {
     WHERE id = $1 AND status = 'pending' RETURNING *`, [row.id, blob.size, blob.contentType || row.mime]);
   if (!ready) return res.status(409).json({ error: 'Upload already finished.' });
 
-  const url = `${baseUrlFor(req)}/f/${ready.id}`;
-  const qrOpts = { errorCorrectionLevel: 'M', margin: 1, color: { dark: '#0b1020', light: '#ffffff' } };
-  const [qrSvg, qrPng] = await Promise.all([
-    QRCode.toString(url, { ...qrOpts, type: 'svg' }),
-    QRCode.toDataURL(url, { ...qrOpts, width: 600 }),
-  ]);
-  res.json({ ...publicMeta(ready), url, qrSvg, qrPng, deleteToken: ready.delete_token });
+  res.json({ ...publicMeta(ready), ...(await shareLink(req, ready.id)), deleteToken: ready.delete_token });
 }));
 
+// File details. With ?share=1 it also returns the link and QR code, so the
+// uploader can reopen them from "Your recent links".
 app.get('/api/files/:id', apiLimiter, h(async (req, res) => {
   const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
   if (row?.status === 'blocked') {
@@ -367,7 +355,7 @@ app.get('/api/files/:id', apiLimiter, h(async (req, res) => {
   }
   if (!row || row.status !== 'ready') return res.status(404).json({ error: 'This link does not exist or was removed.' });
   if (!isActive(row)) return res.status(410).json({ error: 'This link has expired.' });
-  res.json(publicMeta(row));
+  res.json(req.query.share ? { ...publicMeta(row), ...(await shareLink(req, row.id)) } : publicMeta(row));
 }));
 
 app.delete('/api/files/:id', apiLimiter, h(async (req, res) => {

@@ -50,7 +50,6 @@ npm run bundle
 | `ABUSE_EMAIL` | Optional | Abuse contact shown in the footer and legal pages |
 | `ADMIN_SECRET` | Optional | Password for the admin page at `/admin.html` (off when empty) |
 | `REPORT_THRESHOLD` | Optional | Reports from different people before a file is hidden (default 3) |
-| `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | Optional | Cloudflare Turnstile check on uploads (off unless both are set) |
 | `BASE_URL` | Optional | Force the address used in links/QR |
 
 Deployment steps (Arabic): see [DEPLOY.md](DEPLOY.md).

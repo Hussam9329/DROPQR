@@ -43,7 +43,6 @@ npm run dev
 | `ABUSE_EMAIL` | إيميل الشكاوى اللي يطلع بالموقع وبصفحة الشروط |
 | `ADMIN_SECRET` | كلمة سر صفحة الإدارة `/admin.html` |
 | `REPORT_THRESHOLD` | كم بلاغ من أشخاص مختلفين حتى ينخفي الملف تلقائياً (الافتراضي 3) |
-| `TURNSTILE_SITE_KEY` و `TURNSTILE_SECRET_KEY` | فحص "مو روبوت" وقت الرفع. يشتغل بس إذا الاثنين موجودات |
 | `BASE_URL` | إذا ربطت دومين خاص وتريد الروابط تطلع بيه دائماً |
 
 بعد أي تغيير لازم تسوي Redeploy حتى يتطبق.
@@ -58,14 +57,6 @@ npm run dev
 
 الملف ينخفي تلقائياً إذا بلّغ عليه 3 أشخاص مختلفين، وينتظر مراجعتك.
 تكدر تلصق أي رابط بخانة البحث حتى تلگاه، حتى لو ما عليه بلاغ.
-
-## فحص "مو روبوت" (Cloudflare Turnstile)
-
-1. ادخل https://dash.cloudflare.com ← **Turnstile** ← **Add widget**.
-2. الاسم: `DropQR`. الدومين: `dropqr-mu.vercel.app` (وأي دومين خاص تربطه). النوع: **Managed**.
-3. انسخ **Site Key** و **Secret Key** وحطهم بمتغيرات Vercel باسم `TURNSTILE_SITE_KEY` و `TURNSTILE_SECRET_KEY`، وبعدها سوي Redeploy.
-
-ما يطلع للزائر عادةً، إلا إذا Cloudflare شك بيه.
 
 ## ربط دومين خاص
 

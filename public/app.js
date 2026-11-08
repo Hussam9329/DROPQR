@@ -34,7 +34,6 @@ configReady.then((cfg) => {
   renderChips($('#expiry'), cfg.expiryOptions, (v) => EXPIRY_LABELS[v] || v, state.expiry, (v) => { state.expiry = v; updateHints(); });
   renderChips($('#downloads'), cfg.downloadOptions, (v) => (v === 1 ? '1 time' : `${v} times`), state.downloads, (v) => { state.downloads = v; updateHints(); });
   updateHints();
-  if (cfg.turnstileSiteKey) setUpTurnstile(cfg.turnstileSiteKey);
 });
 
 // ---------- File picking ----------
@@ -84,31 +83,6 @@ function setProgress(pct, label) {
   if (label) $('#progress-label').textContent = label;
 }
 
-// ---------- Human check (Cloudflare Turnstile), only when the server has it on ----------
-const turnstile = { widget: null, token: '' };
-
-function setUpTurnstile(siteKey) {
-  window.onTurnstileLoad = () => {
-    turnstile.widget = window.turnstile.render('#turnstile', {
-      sitekey: siteKey,
-      appearance: 'interaction-only', // invisible unless Cloudflare needs the visitor to click
-      callback: (token) => { turnstile.token = token; },
-      'expired-callback': () => { turnstile.token = ''; },
-      'error-callback': () => { turnstile.token = ''; },
-    });
-  };
-  const s = document.createElement('script');
-  s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onTurnstileLoad';
-  s.async = true;
-  document.head.appendChild(s);
-}
-
-function resetTurnstile() {
-  if (turnstile.widget === null) return;
-  turnstile.token = '';
-  window.turnstile.reset(turnstile.widget);
-}
-
 $('#form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const file = state.file;
@@ -120,12 +94,10 @@ $('#form').addEventListener('submit', async (e) => {
   setProgress(0, 'Preparing…');
 
   try {
-    if (turnstile.widget !== null && !turnstile.token) throw new Error('Please complete the human check above.');
     const slot = await api('/api/uploads', {
       name: file.name, size: file.size, type: file.type,
       expiry: state.expiry, maxDownloads: state.downloads,
-      turnstileToken: turnstile.token,
-    }).finally(resetTurnstile); // each check token works only once
+    });
 
     setProgress(0, 'Uploading…');
     await window.blobUpload(slot.pathname, file, {
@@ -232,6 +204,18 @@ async function deleteLink(id, token) {
   return true;
 }
 
+// Shows a saved link's card again: QR code, link, time and downloads left.
+async function reopen(item) {
+  const r = await fetch(`/api/files/${encodeURIComponent(item.id)}?share=1`).catch(() => null);
+  if (!r) return toast('Could not reach the server. Please try again.');
+  if (!r.ok) {
+    toast('This link has expired.');
+    return renderRecent();
+  }
+  showResult({ ...(await r.json()), deleteToken: item.deleteToken });
+  $('.uploader').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
 // ---------- Recent links (this browser only) ----------
 async function renderRecent() {
   const list = store.get().filter((x) => x.expiresAt > nowMs());
@@ -249,10 +233,12 @@ async function renderRecent() {
         <div class="n" style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
         <div class="s" style="color:var(--muted);font-size:13px">Loading…</div>
       </div>
+      <button class="btn btn-ghost q" style="padding:8px 12px;font-size:13px">QR</button>
       <button class="btn btn-ghost c" style="padding:8px 12px;font-size:13px">Copy</button>
       <button class="icon-btn d" aria-label="Delete"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>`;
     row.querySelector('.ficon').textContent = extOf(item.name).slice(0, 4);
     row.querySelector('.n').textContent = item.name;
+    row.querySelector('.q').onclick = () => reopen(item);
     row.querySelector('.c').onclick = () => navigator.clipboard.writeText(item.url).then(() => toast('Link copied'));
     row.querySelector('.d').onclick = () => confirm(`Delete "${item.name}"?`) && deleteLink(item.id, item.deleteToken);
     box.appendChild(row);

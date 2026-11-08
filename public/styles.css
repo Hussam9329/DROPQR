@@ -210,8 +210,6 @@ main { max-width: 1080px; width: 100%; margin: 0 auto; padding: 8px 20px 40px; }
 
 /* ---------- Stage 2: consent, reports, legal pages, admin ---------- */
 .consent { margin: 12px 0 0; font-size: 13px; color: var(--muted); text-align: center; }
-.turnstile:empty { display: none; }
-.turnstile { margin-top: 20px; display: flex; justify-content: center; }
 footer .legal { margin-top: 6px; }
 
 .report { margin-top: 18px; text-align: left; font-size: 14px; }
