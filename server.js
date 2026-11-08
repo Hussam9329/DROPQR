@@ -2,21 +2,26 @@
 
 const express = require('express');
 const QRCode = require('qrcode');
-const rateLimit = require('express-rate-limit');
 const { neon } = require('@neondatabase/serverless');
-const { head, del, get } = require('@vercel/blob');
+const { head, del, issueSignedToken, presignUrl } = require('@vercel/blob');
 const { handleUpload } = require('@vercel/blob/client');
 const crypto = require('node:crypto');
-const { Readable, pipeline } = require('node:stream');
 const path = require('node:path');
 
 // ---------- Config ----------
 const PORT = Number(process.env.PORT) || 3000;
 const BASE_URL = (process.env.BASE_URL || '').replace(/\/+$/, '');
-// Downloads stream through a Vercel Function (max 300 s), so keep files moderate.
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB) || 100;
 const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
-const EXHAUSTED_GRACE_MS = 10 * 60 * 1000; // keep a used-up file this long so the last download can finish
+// Whole-site storage ceiling and how much one visitor may upload per day.
+const STORAGE_CAP_BYTES = (Number(process.env.STORAGE_CAP_GB) || 5) * 1024 ** 3;
+const DAILY_UPLOAD_BYTES = (Number(process.env.DAILY_UPLOAD_MB) || 1024) * 1024 ** 2;
+// Downloads go straight from storage through a signed link valid this long
+// (long enough for a slow connection or a download manager to resume).
+const DOWNLOAD_LINK_MS = 15 * 60 * 1000;
+// A file stays in storage this long after it stops being downloadable,
+// so a download that already started can finish.
+const GRACE_MS = DOWNLOAD_LINK_MS + 5 * 60 * 1000;
 const PENDING_TTL_MS = 2 * 60 * 60 * 1000; // uploads never finished are dropped after this
 
 // Allowed lifetimes (key -> seconds). The client may only pick from these.
@@ -57,6 +62,12 @@ function ensureSchema() {
       last_download_at  TIMESTAMPTZ
     )`);
     await query('CREATE INDEX IF NOT EXISTS idx_files_status_expires ON files (status, expires_at)');
+    // Shared counters for rate limits and daily upload quotas, so every server instance sees the same numbers.
+    await query(`CREATE TABLE IF NOT EXISTS usage_counters (
+      key           TEXT PRIMARY KEY,
+      window_start  TIMESTAMPTZ NOT NULL,
+      amount        BIGINT NOT NULL
+    )`);
   })().catch((err) => { schemaReady = null; throw err; });
   return schemaReady;
 }
@@ -64,8 +75,13 @@ function ensureSchema() {
 const newId = () => crypto.randomBytes(6).toString('base64url'); // 8 chars
 const newToken = () => crypto.randomBytes(24).toString('base64url');
 
+// Control characters and path separators become "_". Invisible direction and
+// zero-width characters are removed, so "invoice<RLO>fdp.exe" cannot pose as a PDF.
 function safeFileName(name) {
-  const clean = String(name || 'file').replace(/[\\/\u0000-\u001f]/g, '_').trim().slice(0, 200);
+  const clean = String(name || 'file').normalize('NFC')
+    .replace(/[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '')
+    .replace(/[\\/\u0000-\u001f\u007f]/g, '_')
+    .trim().slice(0, 200);
   return clean || 'file';
 }
 
@@ -94,9 +110,40 @@ function baseUrlFor(req) {
   return `${req.protocol}://${req.get('host')}`;
 }
 
+// Storage first: if that fails the row stays, so the delete can be retried.
 async function removeFile(row) {
+  await del(row.pathname);
   await query('DELETE FROM files WHERE id = $1', [row.id]);
-  await del(row.pathname).catch(() => {}); // already gone is fine
+}
+
+// Visitors are counted by a keyed hash of their IP, never the raw address.
+function visitorKey(req) {
+  const ip = (process.env.VERCEL && req.get('x-real-ip')) || req.ip || '';
+  return crypto.createHmac('sha256', process.env.CRON_SECRET || 'dropqr').update(ip).digest('base64url').slice(0, 22);
+}
+
+// Adds `amount` to a counter that resets every `windowSec`, and returns the new total.
+async function addUsage(key, windowSec, amount) {
+  const [row] = await query(`INSERT INTO usage_counters (key, window_start, amount) VALUES ($1, now(), $3)
+    ON CONFLICT (key) DO UPDATE SET
+      amount = CASE WHEN usage_counters.window_start <= now() - make_interval(secs => $2)
+                    THEN $3 ELSE usage_counters.amount + $3 END,
+      window_start = CASE WHEN usage_counters.window_start <= now() - make_interval(secs => $2)
+                    THEN now() ELSE usage_counters.window_start END
+    RETURNING amount`, [key, windowSec, amount]);
+  return Number(row.amount);
+}
+
+// Wraps async handlers so errors reach the error handler.
+const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+function limit(bucket, windowSec, max) {
+  return h(async (req, res, next) => {
+    const hits = await addUsage(`${bucket}:${visitorKey(req)}`, windowSec, 1);
+    if (hits <= max) return next();
+    res.set('Retry-After', String(windowSec));
+    res.status(429).json({ error: 'Too many requests. Please wait a little and try again.' });
+  });
 }
 
 // Deletes expired, used-up and abandoned files. Runs from the daily cron
@@ -104,12 +151,13 @@ async function removeFile(row) {
 let lastCleanup = 0;
 async function cleanup() {
   lastCleanup = Date.now();
+  await query("DELETE FROM usage_counters WHERE window_start <= now() - interval '1 day'");
   const rows = await query(`SELECT id, pathname FROM files
-    WHERE (status = 'ready' AND expires_at <= now())
+    WHERE (status = 'ready' AND expires_at <= now() - make_interval(secs => $1))
        OR (status = 'ready' AND downloads >= max_downloads
            AND (last_download_at IS NULL OR last_download_at <= now() - make_interval(secs => $1)))
        OR (status = 'pending' AND created_at <= now() - make_interval(secs => $2))
-    LIMIT 500`, [EXHAUSTED_GRACE_MS / 1000, PENDING_TTL_MS / 1000]);
+    LIMIT 500`, [GRACE_MS / 1000, PENDING_TTL_MS / 1000]);
   if (!rows.length) return 0;
   // Keep the rows if storage deletion fails, so the next run retries them.
   await del(rows.map((r) => r.pathname));
@@ -139,11 +187,11 @@ app.use('/api', async (_req, _res, next) => {
   try { await ensureSchema(); next(); } catch (err) { next(err); }
 });
 
-const uploadLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
-const apiLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
-
-// Wraps async handlers so errors reach the error handler.
-const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const uploadLimiter = limit('upload', 15 * 60, 30);
+const blobTokenLimiter = limit('blob', 15 * 60, 60);
+const completeLimiter = limit('complete', 15 * 60, 30);
+const downloadLimiter = limit('download', 15 * 60, 60);
+const apiLimiter = limit('api', 60, 120);
 
 app.get('/api/config', (_req, res) => {
   res.json({ expiryOptions: Object.keys(EXPIRY_OPTIONS), downloadOptions: DOWNLOAD_OPTIONS, maxFileMb: MAX_FILE_MB });
@@ -161,8 +209,19 @@ app.post('/api/uploads', uploadLimiter, h(async (req, res) => {
   const max = Number(maxDownloads);
   const bytes = Number(size);
   if (!seconds || !DOWNLOAD_OPTIONS.includes(max)) return res.status(400).json({ error: 'Invalid expiry or download limit.' });
-  if (!Number.isFinite(bytes) || bytes <= 0) return res.status(400).json({ error: 'Empty files cannot be shared.' });
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) return res.status(400).json({ error: 'Empty files cannot be shared.' });
   if (bytes > MAX_FILE_BYTES) return res.status(400).json({ error: `File is larger than ${MAX_FILE_MB} MB.` });
+
+  // Unfinished reservations count too, so storage can't be filled by starting many uploads.
+  const [{ used }] = await query("SELECT COALESCE(SUM(size), 0) AS used FROM files WHERE status IN ('pending', 'ready')");
+  if (Number(used) + bytes > STORAGE_CAP_BYTES) {
+    return res.status(503).json({ error: 'The service is full right now. Please try again later.' });
+  }
+  const quotaKey = `bytes:${visitorKey(req)}`;
+  if (await addUsage(quotaKey, 24 * 60 * 60, bytes) > DAILY_UPLOAD_BYTES) {
+    await addUsage(quotaKey, 24 * 60 * 60, -bytes); // a refused upload doesn't use up the quota
+    return res.status(429).json({ error: "You reached today's upload limit. Please try again tomorrow." });
+  }
 
   const id = newId();
   const fileName = safeFileName(name);
@@ -177,7 +236,7 @@ app.post('/api/uploads', uploadLimiter, h(async (req, res) => {
 }));
 
 // Step 2: the browser asks for a one-time token and uploads straight to Blob storage.
-app.post('/api/blob-upload', h(async (req, res) => {
+app.post('/api/blob-upload', blobTokenLimiter, h(async (req, res) => {
   try {
     const result = await handleUpload({
       body: req.body,
@@ -202,7 +261,7 @@ app.post('/api/blob-upload', h(async (req, res) => {
 }));
 
 // Step 3: confirm the file landed, start its timer, and return the link + QR code.
-app.post('/api/uploads/:id/complete', h(async (req, res) => {
+app.post('/api/uploads/:id/complete', completeLimiter, h(async (req, res) => {
   const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
   if (!row || row.delete_token !== String(req.body?.deleteToken || '')) return res.status(404).json({ error: 'Upload not found.' });
   if (row.status !== 'pending') return res.status(409).json({ error: 'Upload already finished.' });
@@ -241,37 +300,34 @@ app.delete('/api/files/:id', apiLimiter, h(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// The actual download. Only this route uses up a download, so opening the
-// share page or a chat-app link preview does not count.
-app.get('/d/:id', apiLimiter, h(async (req, res) => {
-  await ensureSchema();
+// The actual download. Only this POST (sent by the Download button) uses up a
+// download, so link previews, mail scanners and opening the page never count.
+// It returns a short-lived signed link, so the file comes straight from storage:
+// no function time limit, and download managers can pause and resume.
+app.post('/api/files/:id/download', downloadLimiter, h(async (req, res) => {
   const [row] = await query(`UPDATE files SET downloads = downloads + 1, last_download_at = now()
     WHERE id = $1 AND status = 'ready' AND downloads < max_downloads AND expires_at > now()
     RETURNING *`, [req.params.id]);
-  if (!row) return res.redirect(303, `/f/${encodeURIComponent(req.params.id)}`);
+  if (!row) return res.status(410).json({ error: 'This link has expired.' });
 
-  const file = await get(row.pathname, { access: 'private' }).catch(() => null);
-  if (!file || file.statusCode !== 200) {
+  try {
+    const validUntil = Date.now() + DOWNLOAD_LINK_MS;
+    // The token is store-wide ("*") because Vercel's scope check garbles non-ASCII
+    // (e.g. Arabic) paths. Safe: the link's signature still covers this exact path,
+    // and the signing key never leaves the server.
+    const token = await issueSignedToken({ pathname: '*', operations: ['get'], validUntil });
+    const { presignedUrl } = await presignUrl(token, { operation: 'get', pathname: row.pathname, validUntil, access: 'private' });
+    const url = new URL(presignedUrl);
+    url.searchParams.set('download', '1'); // save as a file instead of opening it
+    res.json({ url: url.toString(), remaining: Math.max(0, row.max_downloads - row.downloads) });
+  } catch (err) {
     await query('UPDATE files SET downloads = downloads - 1 WHERE id = $1 AND downloads > 0', [row.id]);
-    return res.status(410).type('text').send('File is no longer available.');
+    throw err;
   }
-
-  res.set({
-    'Content-Type': file.blob.contentType || 'application/octet-stream',
-    // Size recorded at upload (the streamed response may not report one).
-    'Content-Length': String(row.size),
-    'Content-Disposition': `attachment; filename="${row.original_name.replace(/[^ -~]|"/g, '_')}"; filename*=UTF-8''${encodeURIComponent(row.original_name)}`,
-    'Cache-Control': 'private, no-store',
-  });
-
-  // If the transfer is cut off, give the download back.
-  let finished = false;
-  res.on('finish', () => { finished = true; });
-  res.on('close', () => {
-    if (!finished) query('UPDATE files SET downloads = downloads - 1 WHERE id = $1 AND downloads > 0', [row.id]).catch(() => {});
-  });
-  pipeline(Readable.fromWeb(file.stream), res, () => {});
 }));
+
+// Old-style direct links open the download page instead of using up a download.
+app.get('/d/:id', (req, res) => res.redirect(303, `/f/${encodeURIComponent(req.params.id)}`));
 
 // Daily safety-net cleanup (Vercel Cron sends the CRON_SECRET as a bearer token).
 app.get('/api/cron/cleanup', h(async (req, res) => {

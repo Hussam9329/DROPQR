@@ -24,23 +24,45 @@ function render() {
       <div class="stat"><small>Link expires in</small><b id="left">—</b></div>
       <div class="stat"><small>Downloads left</small><b id="dl-left"></b></div>
     </div>
-    <a class="btn btn-primary" id="go">
+    <button class="btn btn-primary" id="go" type="button">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
-      Download file
-    </a>`;
+      <span>Download file</span>
+    </button>`;
   box.querySelector('.big-icon').textContent = extOf(meta.name).slice(0, 4);
   box.querySelector('h1').textContent = meta.name;
   box.querySelector('.sub').textContent = formatBytes(meta.size);
   $('#dl-left').textContent = `${meta.remaining} of ${meta.maxDownloads}`;
-  $('#go').href = `/d/${encodeURIComponent(meta.id)}`;
-  $('#go').addEventListener('click', () => {
-    toast('Download starting…');
-    // Refresh the counter after the server has registered the download.
-    setTimeout(load, 1500);
-  });
+  $('#go').addEventListener('click', download);
   tick();
   clearInterval(timer);
   timer = setInterval(tick, 1000);
+}
+
+// One click = one download: the button stays disabled while the request runs,
+// so a double tap can't use up two downloads.
+async function download() {
+  const btn = $('#go');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.querySelector('span').textContent = 'Preparing…';
+  try {
+    const r = await fetch(`/api/files/${encodeURIComponent(meta.id)}/download`, { method: 'POST' });
+    const data = await r.json().catch(() => ({}));
+    if (r.status === 410) return showGone('This link has expired', 'It ran out of time or reached its download limit.');
+    if (!r.ok) throw new Error(data.error);
+    location.href = data.url; // saved as a file; this page stays open
+    meta.remaining = data.remaining;
+    $('#dl-left').textContent = `${meta.remaining} of ${meta.maxDownloads}`;
+    toast('Download started');
+  } catch (err) {
+    toast(err.message || 'Could not start the download. Please try again.');
+  }
+  // Short pause before another download can be started.
+  setTimeout(() => {
+    if (!$('#go')) return;
+    btn.querySelector('span').textContent = 'Download file';
+    btn.disabled = meta.remaining <= 0;
+  }, 3000);
 }
 
 function tick() {

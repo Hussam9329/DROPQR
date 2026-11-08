@@ -177,9 +177,7 @@ $('#link').onclick = (e) => e.target.select();
 
 $('#delete').onclick = async () => {
   if (!state.current || !confirm('Delete this file now? The link will stop working.')) return;
-  await deleteLink(state.current.id, state.current.deleteToken);
-  toast('File deleted');
-  reset();
+  if (await deleteLink(state.current.id, state.current.deleteToken)) reset();
 };
 
 $('#again').onclick = reset;
@@ -192,10 +190,18 @@ function reset() {
   setFile(null);
 }
 
+// Returns true once the file is gone. On failure the link and its delete
+// token stay saved, so the user can try again.
 async function deleteLink(id, token) {
-  await fetch(`/api/files/${id}`, { method: 'DELETE', headers: { 'X-Delete-Token': token } }).catch(() => {});
+  const r = await fetch(`/api/files/${id}`, { method: 'DELETE', headers: { 'X-Delete-Token': token } }).catch(() => null);
+  if (!r || (!r.ok && r.status !== 404)) {
+    toast('Could not delete the file. Please try again.');
+    return false;
+  }
   store.set(store.get().filter((x) => x.id !== id));
   renderRecent();
+  toast('File deleted');
+  return true;
 }
 
 // ---------- Recent links (this browser only) ----------

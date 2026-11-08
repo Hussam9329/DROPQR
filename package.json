@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "bundle": "esbuild client/blob-upload.js --bundle --minify --format=iife --platform=browser --target=es2020 --outfile=public/vendor/blob-upload.js",
-    "dev": "node --env-file=.env.local server.js"
+    "dev": "node --env-file=.env.local server.js",
+    "test": "node --test test/server.test.js"
   },
   "keywords": [],
   "author": "",
@@ -16,13 +17,13 @@
     "@neondatabase/serverless": "^1.2.0",
     "@vercel/blob": "^2.8.2",
     "express": "^4.22.3",
-    "express-rate-limit": "^8.7.1",
     "qrcode": "^1.5.4"
   },
   "engines": {
     "node": ">=22.13"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.15",
     "esbuild": "^0.25.10"
   }
 }

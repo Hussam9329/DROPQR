@@ -45,6 +45,8 @@ npm run bundle
 | `BLOB_READ_WRITE_TOKEN` | Blob store | Needed to issue browser upload tokens |
 | `CRON_SECRET` | You | Protects `/api/cron/cleanup` |
 | `MAX_FILE_MB` | Optional | Max upload size (default 100) |
+| `STORAGE_CAP_GB` | Optional | Whole-site storage ceiling; new uploads are refused above it (default 5) |
+| `DAILY_UPLOAD_MB` | Optional | Upload quota per visitor per day (default 1024) |
 | `BASE_URL` | Optional | Force the address used in links/QR |
 
 Deployment steps (Arabic): see [DEPLOY.md](DEPLOY.md).
