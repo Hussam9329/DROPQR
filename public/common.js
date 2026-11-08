@@ -40,3 +40,18 @@ const store = {
   get() { try { return JSON.parse(localStorage.getItem('dropqr:links') || '[]'); } catch { return []; } },
   set(list) { try { localStorage.setItem('dropqr:links', JSON.stringify(list.slice(0, 20))); } catch {} },
 };
+
+// Site settings from the server, loaded once per page.
+const configReady = fetch('/api/config').then((r) => r.json()).catch(() => ({}));
+
+// Shows the abuse contact wherever the page has a .abuse-email slot.
+configReady.then((cfg) => {
+  document.querySelectorAll('.abuse-email').forEach((el) => {
+    if (!cfg.abuseEmail) { (el.closest('.abuse-contact') || el).hidden = true; return; }
+    const inFooter = !!el.closest('.legal');
+    const a = document.createElement('a');
+    a.href = `mailto:${cfg.abuseEmail}`;
+    a.textContent = inFooter ? 'Report abuse' : cfg.abuseEmail;
+    el.replaceChildren(inFooter ? ' · ' : '', a);
+  });
+});

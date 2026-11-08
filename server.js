@@ -38,6 +38,20 @@ const EXPIRY_OPTIONS = {
 };
 const DOWNLOAD_OPTIONS = [1, 2, 3, 4, 5, 10, 25, 50, 100];
 
+// Abuse handling: a file is hidden after this many reports from different people.
+const REPORT_THRESHOLD = Number(process.env.REPORT_THRESHOLD) || 3;
+const REPORT_REASONS = {
+  malware: 'Malware or virus',
+  phishing: 'Phishing or scam',
+  illegal: 'Illegal content',
+  copyright: 'Copyright infringement',
+  other: 'Something else',
+};
+const ABUSE_EMAIL = process.env.ABUSE_EMAIL || '';
+// Cloudflare Turnstile ("are you human" check) on uploads. Off until both keys are set.
+const TURNSTILE_SITE_KEY = process.env.TURNSTILE_SITE_KEY || '';
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
+
 // ---------- Database (Neon) ----------
 const sql = neon(process.env.DATABASE_URL);
 const query = (text, params = []) => sql.query(text, params);
@@ -62,6 +76,17 @@ function ensureSchema() {
       last_download_at  TIMESTAMPTZ
     )`);
     await query('CREATE INDEX IF NOT EXISTS idx_files_status_expires ON files (status, expires_at)');
+    await query('ALTER TABLE files ADD COLUMN IF NOT EXISTS reports INTEGER NOT NULL DEFAULT 0');
+    await query('ALTER TABLE files ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ');
+    // One row per person per file, so one person can't push a file over the threshold alone.
+    await query(`CREATE TABLE IF NOT EXISTS reports (
+      file_id     TEXT NOT NULL REFERENCES files (id) ON DELETE CASCADE,
+      reporter    TEXT NOT NULL,
+      reason      TEXT NOT NULL,
+      details     TEXT NOT NULL DEFAULT '',
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (file_id, reporter)
+    )`);
     // Shared counters for rate limits and daily upload quotas, so every server instance sees the same numbers.
     await query(`CREATE TABLE IF NOT EXISTS usage_counters (
       key           TEXT PRIMARY KEY,
@@ -137,6 +162,37 @@ async function addUsage(key, windowSec, amount) {
 // Wraps async handlers so errors reach the error handler.
 const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
+// A short-lived link that downloads the file straight from storage.
+// The token is store-wide ("*") because Vercel's scope check garbles non-ASCII
+// (e.g. Arabic) paths. Safe: the link's signature still covers this exact path,
+// and the signing key never leaves the server.
+async function signedDownloadUrl(pathname) {
+  const validUntil = Date.now() + DOWNLOAD_LINK_MS;
+  const token = await issueSignedToken({ pathname: '*', operations: ['get'], validUntil });
+  const { presignedUrl } = await presignUrl(token, { operation: 'get', pathname, validUntil, access: 'private' });
+  const url = new URL(presignedUrl);
+  url.searchParams.set('download', '1'); // save as a file instead of opening it
+  return url.toString();
+}
+
+function sameSecret(given, expected) {
+  const a = Buffer.from(String(given));
+  const b = Buffer.from(String(expected));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+async function passedTurnstile(req) {
+  if (!TURNSTILE_SECRET_KEY) return true;
+  const token = String(req.body?.turnstileToken || '');
+  if (!token) return false;
+  const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    method: 'POST',
+    body: new URLSearchParams({ secret: TURNSTILE_SECRET_KEY, response: token, remoteip: req.get('x-real-ip') || req.ip || '' }),
+  }).catch(() => null);
+  const data = r ? await r.json().catch(() => ({})) : {};
+  return data.success === true;
+}
+
 function limit(bucket, windowSec, max) {
   return h(async (req, res, next) => {
     const hits = await addUsage(`${bucket}:${visitorKey(req)}`, windowSec, 1);
@@ -156,6 +212,7 @@ async function cleanup() {
     WHERE (status = 'ready' AND expires_at <= now() - make_interval(secs => $1))
        OR (status = 'ready' AND downloads >= max_downloads
            AND (last_download_at IS NULL OR last_download_at <= now() - make_interval(secs => $1)))
+       OR (status = 'blocked' AND expires_at <= now() - make_interval(secs => $1))
        OR (status = 'pending' AND created_at <= now() - make_interval(secs => $2))
     LIMIT 500`, [GRACE_MS / 1000, PENDING_TTL_MS / 1000]);
   if (!rows.length) return 0;
@@ -192,9 +249,26 @@ const blobTokenLimiter = limit('blob', 15 * 60, 60);
 const completeLimiter = limit('complete', 15 * 60, 30);
 const downloadLimiter = limit('download', 15 * 60, 60);
 const apiLimiter = limit('api', 60, 120);
+const reportLimiter = limit('report', 60 * 60, 10);
+const adminLimiter = limit('admin', 15 * 60, 60);
+
+function requireAdmin(req, res, next) {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret || !sameSecret(req.get('authorization') || '', `Bearer ${secret}`)) {
+    return res.status(401).json({ error: 'Wrong admin password.' });
+  }
+  next();
+}
 
 app.get('/api/config', (_req, res) => {
-  res.json({ expiryOptions: Object.keys(EXPIRY_OPTIONS), downloadOptions: DOWNLOAD_OPTIONS, maxFileMb: MAX_FILE_MB });
+  res.json({
+    expiryOptions: Object.keys(EXPIRY_OPTIONS),
+    downloadOptions: DOWNLOAD_OPTIONS,
+    maxFileMb: MAX_FILE_MB,
+    reportReasons: REPORT_REASONS,
+    abuseEmail: ABUSE_EMAIL,
+    turnstileSiteKey: TURNSTILE_SECRET_KEY ? TURNSTILE_SITE_KEY : '',
+  });
 });
 
 app.get('/api/health', h(async (_req, res) => {
@@ -211,6 +285,9 @@ app.post('/api/uploads', uploadLimiter, h(async (req, res) => {
   if (!seconds || !DOWNLOAD_OPTIONS.includes(max)) return res.status(400).json({ error: 'Invalid expiry or download limit.' });
   if (!Number.isSafeInteger(bytes) || bytes <= 0) return res.status(400).json({ error: 'Empty files cannot be shared.' });
   if (bytes > MAX_FILE_BYTES) return res.status(400).json({ error: `File is larger than ${MAX_FILE_MB} MB.` });
+  if (!(await passedTurnstile(req))) {
+    return res.status(403).json({ error: 'Please complete the human check and try again.' });
+  }
 
   // Unfinished reservations count too, so storage can't be filled by starting many uploads.
   const [{ used }] = await query("SELECT COALESCE(SUM(size), 0) AS used FROM files WHERE status IN ('pending', 'ready')");
@@ -285,6 +362,9 @@ app.post('/api/uploads/:id/complete', completeLimiter, h(async (req, res) => {
 
 app.get('/api/files/:id', apiLimiter, h(async (req, res) => {
   const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
+  if (row?.status === 'blocked') {
+    return res.status(451).json({ error: 'This file was removed after being reported as harmful.' });
+  }
   if (!row || row.status !== 'ready') return res.status(404).json({ error: 'This link does not exist or was removed.' });
   if (!isActive(row)) return res.status(410).json({ error: 'This link has expired.' });
   res.json(publicMeta(row));
@@ -293,9 +373,7 @@ app.get('/api/files/:id', apiLimiter, h(async (req, res) => {
 app.delete('/api/files/:id', apiLimiter, h(async (req, res) => {
   const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
   if (!row) return res.status(404).json({ error: 'Not found.' });
-  const a = Buffer.from(req.get('x-delete-token') || '');
-  const b = Buffer.from(row.delete_token);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(403).json({ error: 'Not allowed.' });
+  if (!sameSecret(req.get('x-delete-token') || '', row.delete_token)) return res.status(403).json({ error: 'Not allowed.' });
   await removeFile(row);
   res.json({ ok: true });
 }));
@@ -311,19 +389,88 @@ app.post('/api/files/:id/download', downloadLimiter, h(async (req, res) => {
   if (!row) return res.status(410).json({ error: 'This link has expired.' });
 
   try {
-    const validUntil = Date.now() + DOWNLOAD_LINK_MS;
-    // The token is store-wide ("*") because Vercel's scope check garbles non-ASCII
-    // (e.g. Arabic) paths. Safe: the link's signature still covers this exact path,
-    // and the signing key never leaves the server.
-    const token = await issueSignedToken({ pathname: '*', operations: ['get'], validUntil });
-    const { presignedUrl } = await presignUrl(token, { operation: 'get', pathname: row.pathname, validUntil, access: 'private' });
-    const url = new URL(presignedUrl);
-    url.searchParams.set('download', '1'); // save as a file instead of opening it
-    res.json({ url: url.toString(), remaining: Math.max(0, row.max_downloads - row.downloads) });
+    const url = await signedDownloadUrl(row.pathname);
+    res.json({ url, remaining: Math.max(0, row.max_downloads - row.downloads) });
   } catch (err) {
     await query('UPDATE files SET downloads = downloads - 1 WHERE id = $1 AND downloads > 0', [row.id]);
     throw err;
   }
+}));
+
+// Anyone can report a file. Each person counts once; at REPORT_THRESHOLD
+// reports the file is hidden until an admin reviews it.
+app.post('/api/files/:id/report', reportLimiter, h(async (req, res) => {
+  const reason = String(req.body?.reason || '');
+  if (!Object.hasOwn(REPORT_REASONS, reason)) return res.status(400).json({ error: 'Please choose a reason.' });
+  const details = String(req.body?.details || '').trim().slice(0, 1000);
+  const [row] = await query("SELECT id FROM files WHERE id = $1 AND status = 'ready'", [req.params.id]);
+  if (!row) return res.status(404).json({ error: 'This link does not exist or was removed.' });
+
+  const added = await query(`INSERT INTO reports (file_id, reporter, reason, details) VALUES ($1, $2, $3, $4)
+    ON CONFLICT DO NOTHING RETURNING file_id`, [row.id, visitorKey(req), reason, details]);
+  if (added.length) {
+    await query(`UPDATE files SET reports = reports + 1,
+        status = CASE WHEN reports + 1 >= $2 THEN 'blocked' ELSE status END,
+        blocked_at = CASE WHEN reports + 1 >= $2 THEN now() ELSE blocked_at END
+      WHERE id = $1 AND status = 'ready'`, [row.id, REPORT_THRESHOLD]);
+  }
+  res.json({ ok: true });
+}));
+
+// ---------- Admin (protected by ADMIN_SECRET) ----------
+app.use('/api/admin', adminLimiter, requireAdmin);
+
+// Reported or blocked files, or one file by id.
+app.get('/api/admin/files', h(async (req, res) => {
+  const id = String(req.query.id || '').trim();
+  const files = await query(`SELECT id, original_name, size, status, reports, downloads, max_downloads,
+      created_at, expires_at, blocked_at
+    FROM files
+    WHERE ${id ? 'id = $1' : "status = 'blocked' OR (status = 'ready' AND reports > 0)"}
+    ORDER BY blocked_at DESC NULLS LAST, reports DESC, created_at DESC
+    LIMIT 200`, id ? [id] : []);
+  const reports = files.length
+    ? await query(`SELECT file_id, reason, details, created_at FROM reports
+        WHERE file_id = ANY($1) ORDER BY created_at DESC`, [files.map((f) => f.id)])
+    : [];
+  res.json({
+    reasons: REPORT_REASONS,
+    files: files.map((f) => ({
+      ...f,
+      size: Number(f.size),
+      reports: reports.filter((r) => r.file_id === f.id).map(({ file_id, ...r }) => r),
+    })),
+  });
+}));
+
+app.post('/api/admin/files/:id/block', h(async (req, res) => {
+  const [row] = await query(`UPDATE files SET status = 'blocked', blocked_at = now()
+    WHERE id = $1 AND status = 'ready' RETURNING id`, [req.params.id]);
+  if (!row) return res.status(404).json({ error: 'No active file with this id.' });
+  res.json({ ok: true });
+}));
+
+// A false alarm: the file works again and its reports are cleared.
+app.post('/api/admin/files/:id/unblock', h(async (req, res) => {
+  const [row] = await query(`UPDATE files SET status = 'ready', blocked_at = NULL, reports = 0
+    WHERE id = $1 AND status IN ('blocked', 'ready') RETURNING id`, [req.params.id]);
+  if (!row) return res.status(404).json({ error: 'File not found.' });
+  await query('DELETE FROM reports WHERE file_id = $1', [row.id]);
+  res.json({ ok: true });
+}));
+
+app.delete('/api/admin/files/:id', h(async (req, res) => {
+  const [row] = await query('SELECT id, pathname FROM files WHERE id = $1', [req.params.id]);
+  if (!row) return res.status(404).json({ error: 'File not found.' });
+  await removeFile(row);
+  res.json({ ok: true });
+}));
+
+// Lets the admin check a reported file without using up its downloads.
+app.post('/api/admin/files/:id/link', h(async (req, res) => {
+  const [row] = await query("SELECT pathname FROM files WHERE id = $1 AND status IN ('ready', 'blocked')", [req.params.id]);
+  if (!row) return res.status(404).json({ error: 'File not found.' });
+  res.json({ url: await signedDownloadUrl(row.pathname) });
 }));
 
 // Old-style direct links open the download page instead of using up a download.

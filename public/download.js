@@ -27,12 +27,22 @@ function render() {
     <button class="btn btn-primary" id="go" type="button">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
       <span>Download file</span>
-    </button>`;
+    </button>
+    <details class="report">
+      <summary>Report this file</summary>
+      <form id="report-form">
+        <label for="report-reason">What is wrong with it?</label>
+        <select id="report-reason" required><option value="">Choose a reason…</option></select>
+        <textarea id="report-details" maxlength="1000" rows="3" placeholder="Details (optional)"></textarea>
+        <button class="btn btn-ghost" type="submit">Send report</button>
+      </form>
+    </details>`;
   box.querySelector('.big-icon').textContent = extOf(meta.name).slice(0, 4);
   box.querySelector('h1').textContent = meta.name;
   box.querySelector('.sub').textContent = formatBytes(meta.size);
   $('#dl-left').textContent = `${meta.remaining} of ${meta.maxDownloads}`;
   $('#go').addEventListener('click', download);
+  setUpReport();
   tick();
   clearInterval(timer);
   timer = setInterval(tick, 1000);
@@ -65,6 +75,32 @@ async function download() {
   }, 3000);
 }
 
+function setUpReport() {
+  configReady.then((cfg) => {
+    for (const [value, label] of Object.entries(cfg.reportReasons || {})) {
+      $('#report-reason').append(new Option(label, value));
+    }
+  });
+  $('#report-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button');
+    btn.disabled = true;
+    try {
+      const r = await fetch(`/api/files/${encodeURIComponent(meta.id)}/report`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: $('#report-reason').value, details: $('#report-details').value }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error);
+      $('.report').innerHTML = '<p class="report-done">Thanks — we will review this file.</p>';
+    } catch (err) {
+      toast(err.message || 'Could not send the report. Please try again.');
+      btn.disabled = false;
+    }
+  });
+}
+
 function tick() {
   const ms = meta.expiresAt - nowMs();
   if (ms <= 0) return showGone('This link has expired', 'The file was deleted when its time ran out.');
@@ -75,6 +111,7 @@ async function load() {
   try {
     const r = await fetch(`/api/files/${encodeURIComponent(id)}`);
     if (r.status === 404) return showGone('Link not found', 'This link does not exist, or the file was already deleted.');
+    if (r.status === 451) return showGone('File removed', 'This file was taken down after people reported it as harmful.');
     if (!r.ok) return showGone('This link has expired', 'It ran out of time or reached its download limit.');
     const fresh = await r.json();
     syncClock(fresh);

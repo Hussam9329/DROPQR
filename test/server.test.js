@@ -11,7 +11,20 @@ const { PGlite } = require('@electric-sql/pglite');
 process.env.CRON_SECRET = 'test-secret';
 process.env.STORAGE_CAP_GB = String(3 / 1024); // 3 MB for the whole site
 process.env.DAILY_UPLOAD_MB = '1'; // 1 MB per visitor per day
-delete process.env.VERCEL;
+process.env.ADMIN_SECRET = 'admin-pass';
+process.env.TURNSTILE_SITE_KEY = 'site-key';
+process.env.TURNSTILE_SECRET_KEY = 'turnstile-secret';
+process.env.VERCEL = '1'; // visitors are told apart by the x-real-ip header
+
+// Fake Cloudflare Turnstile: only the token "good" passes.
+const realFetch = global.fetch;
+global.fetch = async (url, opts) => {
+  if (String(url).startsWith('https://challenges.cloudflare.com/')) {
+    const ok = opts.body.get('response') === 'good' && opts.body.get('secret') === 'turnstile-secret';
+    return new Response(JSON.stringify({ success: ok }));
+  }
+  return realFetch(url, opts);
+};
 delete process.env.DATABASE_URL;
 
 const pg = new PGlite();
@@ -65,12 +78,12 @@ let turn = 0;
 const base = () => bases[turn++ % bases.length]; // alternate instances
 const json = (method, url, body, headers = {}) => fetch(base() + url, {
   method, redirect: 'manual',
-  headers: { 'content-type': 'application/json', ...headers },
+  headers: { 'content-type': 'application/json', 'x-real-ip': '10.0.0.1', ...headers },
   body: body && JSON.stringify(body),
 });
 
 async function share({ name = 'note.txt', size = 1000, maxDownloads = 4 } = {}) {
-  const r = await json('POST', '/api/uploads', { name, size, type: 'text/plain', expiry: '1h', maxDownloads });
+  const r = await json('POST', '/api/uploads', { name, size, type: 'text/plain', expiry: '1h', maxDownloads, turnstileToken: 'good' });
   const res = { status: r.status, body: await r.json() };
   if (r.status !== 201) return res;
   blobs.set(res.body.pathname, { size, contentType: 'text/plain' }); // the browser's direct upload
@@ -178,10 +191,82 @@ test('rate limit is shared by all instances', async () => {
   await pg.query('DELETE FROM usage_counters');
   const codes = [];
   for (let i = 0; i < 32; i++) {
-    const r = await json('POST', '/api/uploads', { name: 'x.txt', size: 10, expiry: '5m', maxDownloads: 1 });
+    const r = await json('POST', '/api/uploads', { name: 'x.txt', size: 10, expiry: '5m', maxDownloads: 1, turnstileToken: 'good' });
     codes.push(r.status);
   }
   // 30 allowed in 15 minutes, counted together even though requests alternate between two instances.
   assert.equal(codes.filter((c) => c === 201).length, 30);
   assert.deepEqual(codes.slice(30), [429, 429]);
+});
+
+// ---------- Stage 2: Turnstile, reports, admin ----------
+const admin = (method, url) => json(method, url, null, { authorization: 'Bearer admin-pass' });
+const report = (id, ip, reason = 'malware', details = '') => json('POST', `/api/files/${id}/report`, { reason, details }, { 'x-real-ip': ip });
+
+test('uploads need a passed human check', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const base = { name: 'a.txt', size: 10, expiry: '5m', maxDownloads: 1 };
+  assert.equal((await json('POST', '/api/uploads', base)).status, 403);
+  assert.equal((await json('POST', '/api/uploads', { ...base, turnstileToken: 'bad' })).status, 403);
+  assert.equal((await json('POST', '/api/uploads', { ...base, turnstileToken: 'good' })).status, 201);
+  const cfg = await (await json('GET', '/api/config')).json();
+  assert.equal(cfg.turnstileSiteKey, 'site-key');
+  assert.equal(cfg.reportReasons.malware, 'Malware or virus');
+});
+
+test('reports: one per person, file hidden at 3 different people', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const { body } = await share();
+  assert.equal((await report(body.id, '1.1.1.1', 'nonsense')).status, 400);
+  assert.equal((await report(body.id, '1.1.1.1')).status, 200);
+  assert.equal((await report(body.id, '1.1.1.1', 'phishing')).status, 200); // same person again: not counted
+  assert.equal((await report(body.id, '2.2.2.2', 'other', 'looks fake')).status, 200);
+  assert.equal((await json('GET', `/api/files/${body.id}`)).status, 200); // 2 people: still live
+  assert.equal((await report(body.id, '3.3.3.3')).status, 200);
+  const gone = await json('GET', `/api/files/${body.id}`);
+  assert.equal(gone.status, 451);
+  assert.equal((await json('POST', `/api/files/${body.id}/download`)).status, 410);
+  assert.equal((await report(body.id, '4.4.4.4')).status, 404); // already hidden
+});
+
+test('admin: wrong password is refused', async () => {
+  assert.equal((await json('GET', '/api/admin/files')).status, 401);
+  assert.equal((await json('GET', '/api/admin/files', null, { authorization: 'Bearer nope' })).status, 401);
+});
+
+test('admin: review, unblock, block, link and delete', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const { body } = await share({ name: 'suspicious.exe' });
+  await report(body.id, '5.5.5.5', 'malware', 'my antivirus flagged it');
+  const listed = await (await admin('GET', '/api/admin/files')).json();
+  const f = listed.files.find((x) => x.id === body.id);
+  assert.equal(f.status, 'ready');
+  assert.equal(f.reports.length, 1);
+  assert.equal(f.reports[0].details, 'my antivirus flagged it');
+
+  assert.equal((await admin('POST', `/api/admin/files/${body.id}/block`)).status, 200);
+  assert.equal((await json('GET', `/api/files/${body.id}`)).status, 451);
+  const link = await (await admin('POST', `/api/admin/files/${body.id}/link`)).json();
+  assert.match(link.url, /suspicious.exe/);
+
+  assert.equal((await admin('POST', `/api/admin/files/${body.id}/unblock`)).status, 200);
+  assert.equal((await json('GET', `/api/files/${body.id}`)).status, 200);
+  const after = await (await admin('GET', `/api/admin/files?id=${body.id}`)).json();
+  assert.equal(after.files[0].reports.length, 0); // false alarm: reports cleared
+
+  assert.equal((await admin('DELETE', `/api/admin/files/${body.id}`)).status, 200);
+  assert.equal((await json('GET', `/api/files/${body.id}`)).status, 404);
+  assert.equal(blobs.has(body.pathname), false);
+  const reportsLeft = await pg.query('SELECT 1 FROM reports WHERE file_id = $1', [body.id]);
+  assert.equal(reportsLeft.rows.length, 0);
+});
+
+test('blocked files are cleaned up after they expire', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const { body } = await share();
+  await admin('POST', `/api/admin/files/${body.id}/block`);
+  await pg.query("UPDATE files SET expires_at = now() - interval '1 hour' WHERE id = $1", [body.id]);
+  await json('GET', '/api/cron/cleanup', null, { authorization: 'Bearer test-secret' });
+  assert.equal((await pg.query('SELECT 1 FROM files WHERE id = $1', [body.id])).rows.length, 0);
+  assert.equal(blobs.has(body.pathname), false);
 });

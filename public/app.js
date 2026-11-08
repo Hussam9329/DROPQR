@@ -28,12 +28,13 @@ function updateHints() {
   $('#dl-hint').textContent = state.downloads === 1 ? '1 download' : `${state.downloads} downloads`;
 }
 
-fetch('/api/config').then((r) => r.json()).then((cfg) => {
+configReady.then((cfg) => {
   state.maxBytes = cfg.maxFileMb * 1024 * 1024;
   $('#limit-text').textContent = `Any file type · up to ${cfg.maxFileMb} MB`;
   renderChips($('#expiry'), cfg.expiryOptions, (v) => EXPIRY_LABELS[v] || v, state.expiry, (v) => { state.expiry = v; updateHints(); });
   renderChips($('#downloads'), cfg.downloadOptions, (v) => (v === 1 ? '1 time' : `${v} times`), state.downloads, (v) => { state.downloads = v; updateHints(); });
   updateHints();
+  if (cfg.turnstileSiteKey) setUpTurnstile(cfg.turnstileSiteKey);
 });
 
 // ---------- File picking ----------
@@ -83,6 +84,31 @@ function setProgress(pct, label) {
   if (label) $('#progress-label').textContent = label;
 }
 
+// ---------- Human check (Cloudflare Turnstile), only when the server has it on ----------
+const turnstile = { widget: null, token: '' };
+
+function setUpTurnstile(siteKey) {
+  window.onTurnstileLoad = () => {
+    turnstile.widget = window.turnstile.render('#turnstile', {
+      sitekey: siteKey,
+      appearance: 'interaction-only', // invisible unless Cloudflare needs the visitor to click
+      callback: (token) => { turnstile.token = token; },
+      'expired-callback': () => { turnstile.token = ''; },
+      'error-callback': () => { turnstile.token = ''; },
+    });
+  };
+  const s = document.createElement('script');
+  s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onTurnstileLoad';
+  s.async = true;
+  document.head.appendChild(s);
+}
+
+function resetTurnstile() {
+  if (turnstile.widget === null) return;
+  turnstile.token = '';
+  window.turnstile.reset(turnstile.widget);
+}
+
 $('#form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const file = state.file;
@@ -94,10 +120,12 @@ $('#form').addEventListener('submit', async (e) => {
   setProgress(0, 'Preparing…');
 
   try {
+    if (turnstile.widget !== null && !turnstile.token) throw new Error('Please complete the human check above.');
     const slot = await api('/api/uploads', {
       name: file.name, size: file.size, type: file.type,
       expiry: state.expiry, maxDownloads: state.downloads,
-    });
+      turnstileToken: turnstile.token,
+    }).finally(resetTurnstile); // each check token works only once
 
     setProgress(0, 'Uploading…');
     await window.blobUpload(slot.pathname, file, {

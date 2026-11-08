@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Admin — DropQR</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><path d='M9 9h5v5H9zM18 9h5v5h-5zM9 18h5v5H9zM18 18h2v2h-2zM21 21h2v2h-2z' fill='white'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="/"><span class="brand-mark"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h3v3h-3zM18 18h3v3h-3zM14 18h3v3h-3zM18 14h3v3h-3z"/></svg></span>DropQR</a>
+    <button class="btn btn-ghost" id="logout" type="button" hidden>Sign out</button>
+  </header>
+
+  <main>
+    <section class="card admin-login" id="login">
+      <h1>Admin</h1>
+      <form id="login-form">
+        <input type="password" id="secret" placeholder="Admin password" autocomplete="current-password" required>
+        <button class="btn btn-primary" type="submit">Sign in</button>
+      </form>
+      <div class="error" id="login-error" role="alert"></div>
+    </section>
+
+    <section id="panel" hidden>
+      <form class="admin-search" id="search-form">
+        <input id="search" placeholder="Paste a link or file id to look it up">
+        <button class="btn btn-ghost" type="submit">Find</button>
+        <button class="btn btn-ghost" type="button" id="show-reported">Reported files</button>
+      </form>
+      <h2 class="admin-title" id="list-title">Reported files</h2>
+      <div id="list"></div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/common.js"></script>
+  <script src="/admin.js"></script>
+</body>
+</html>
