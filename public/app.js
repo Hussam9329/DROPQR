@@ -1,4 +1,20 @@
-const state = { file: null, expiry: '1h', downloads: 4, maxBytes: Infinity, current: null, timer: null, upload: null };
+const state = { files: [], expiry: '1h', downloads: 4, maxBytes: Infinity, maxFiles: 20, current: null, timer: null, upload: null };
+
+// The last time and download choices are remembered on this device.
+const PREFS_KEY = 'dropqr:prefs';
+try {
+  const saved = JSON.parse(localStorage.getItem(PREFS_KEY) || '{}');
+  if (saved.expiry) state.expiry = saved.expiry;
+  if (saved.downloads) state.downloads = saved.downloads;
+} catch {}
+function savePrefs() {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ expiry: state.expiry, downloads: state.downloads })); } catch {}
+}
+
+// "photo.jpg" or "photo.jpg + 4 more"
+function linkLabel(files) {
+  return files.length > 1 ? t('moreFiles', { name: files[0].name, n: files.length - 1 }) : files[0].name;
+}
 
 // ---------- Option chips ----------
 function renderChips(container, values, label, selected, onPick) {
@@ -38,44 +54,89 @@ configReady.then((cfg) => {
     return;
   }
   state.maxBytes = cfg.maxFileMb * 1024 * 1024;
-  $('#limit-text').textContent = t('dropLimit', { mb: cfg.maxFileMb });
-  renderChips($('#expiry'), cfg.expiryOptions, (v) => t(`exp_${v}`), state.expiry, (v) => { state.expiry = v; updateHints(); });
-  renderChips($('#downloads'), cfg.downloadOptions, (v) => countText(v, 'oneTime', 'nTimes', 'nTimesMany'), state.downloads, (v) => { state.downloads = v; updateHints(); });
+  state.maxFiles = cfg.maxFiles || 20;
+  if (!cfg.expiryOptions.includes(state.expiry)) state.expiry = '1h';
+  if (!cfg.downloadOptions.includes(state.downloads)) state.downloads = 4;
+  $('#limit-text').textContent = t('dropLimit', { mb: cfg.maxFileMb, max: state.maxFiles });
+  renderChips($('#expiry'), cfg.expiryOptions, (v) => t(`exp_${v}`), state.expiry, (v) => { state.expiry = v; updateHints(); savePrefs(); });
+  renderChips($('#downloads'), cfg.downloadOptions, (v) => countText(v, 'oneTime', 'nTimes', 'nTimesMany'), state.downloads, (v) => { state.downloads = v; updateHints(); savePrefs(); });
   updateHints();
-  if (state.file) $('#submit').disabled = false;
+  renderPicked();
 });
 
 // ---------- File picking ----------
 const dz = $('#dropzone');
 const input = $('#file');
+const totalBytes = () => state.files.reduce((sum, f) => sum + f.size, 0);
 
-function setFile(f) {
+function addFiles(list) {
+  if (state.upload) return;
   $('#error').textContent = '';
-  if (f && f.size > state.maxBytes) {
-    $('#error').textContent = t('tooBig', { size: formatBytes(f.size), max: formatBytes(state.maxBytes) });
-    f = null;
-  }
-  state.file = f || null;
-  $('#chip').classList.toggle('show', !!f);
-  dz.style.display = f ? 'none' : '';
-  $('#submit').disabled = !f || state.maxBytes === Infinity;
-  if (f) {
-    $('#chip-name').textContent = f.name;
-    $('#chip-size').textContent = formatBytes(f.size);
-    $('#chip-ext').textContent = extOf(f.name).slice(0, 4);
-  } else {
-    input.value = '';
-  }
+  const room = state.maxFiles - state.files.length;
+  const incoming = [...list].filter((f) => f.size > 0);
+  if (incoming.length > room) $('#error').textContent = t('tooManyFiles', { max: state.maxFiles });
+  state.files.push(...incoming.slice(0, Math.max(0, room)));
+  renderPicked();
 }
 
-input.addEventListener('change', () => setFile(input.files[0]));
-$('#chip-remove').onclick = () => setFile(null);
+function removeFile(i) {
+  state.files.splice(i, 1);
+  $('#error').textContent = '';
+  renderPicked();
+}
+
+function renderPicked() {
+  const files = state.files;
+  const total = totalBytes();
+  const tooBig = total > state.maxBytes;
+  dz.style.display = files.length ? 'none' : '';
+  $('#picked').hidden = !files.length;
+  $('#add-more').hidden = files.length >= state.maxFiles;
+  $('#picked-total').textContent = t('filesTotal', {
+    files: countText(files.length, 'oneFile', 'nFiles', 'nFilesMany'), size: formatBytes(total),
+  });
+  // The size message comes and goes as files are added or removed.
+  if (tooBig) $('#error').textContent = t('tooBig', { size: formatBytes(total), max: formatBytes(state.maxBytes) });
+  else if (state.sizeError) $('#error').textContent = '';
+  state.sizeError = tooBig;
+  $('#submit').disabled = !files.length || tooBig || state.maxBytes === Infinity;
+
+  const list = $('#file-list');
+  list.innerHTML = '';
+  files.forEach((f, i) => {
+    const row = document.createElement('div');
+    row.className = 'file-chip show';
+    row.innerHTML = `
+      <div class="ficon"></div>
+      <div class="meta"><div class="name fname" dir="ltr"></div><div class="size"></div></div>
+      <button type="button" class="icon-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>`;
+    row.querySelector('.ficon').textContent = extOf(f.name).slice(0, 4);
+    row.querySelector('.name').textContent = f.name;
+    row.querySelector('.size').textContent = formatBytes(f.size);
+    const btn = row.querySelector('button');
+    btn.setAttribute('aria-label', `${t('removeFile')}: ${f.name}`);
+    btn.onclick = () => removeFile(i);
+    list.appendChild(row);
+  });
+  if (!files.length) input.value = '';
+}
+
+input.addEventListener('change', () => { addFiles(input.files); input.value = ''; });
+$('#add-more').onclick = () => input.click();
 ['dragenter', 'dragover'].forEach((e) => dz.addEventListener(e, (ev) => { ev.preventDefault(); dz.classList.add('drag'); }));
 ['dragleave', 'drop'].forEach((e) => dz.addEventListener(e, (ev) => { ev.preventDefault(); dz.classList.remove('drag'); }));
-dz.addEventListener('drop', (ev) => setFile(ev.dataTransfer.files[0]));
 // Allow dropping anywhere on the page
 window.addEventListener('dragover', (e) => e.preventDefault());
-window.addEventListener('drop', (e) => { e.preventDefault(); if (!state.current && !state.upload && e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
+window.addEventListener('drop', (e) => { e.preventDefault(); if (!state.current && e.dataTransfer.files.length) addFiles(e.dataTransfer.files); });
+// Paste a screenshot or copied files (Ctrl+V), unless the visitor is typing in a field.
+window.addEventListener('paste', (e) => {
+  if (state.current || e.target.closest('input, textarea')) return;
+  const files = e.clipboardData && e.clipboardData.files;
+  if (!files || !files.length) return;
+  e.preventDefault();
+  addFiles(files);
+  toast(t('pasted'));
+});
 
 $('#use-password').addEventListener('change', (e) => {
   $('#password-box').hidden = !e.target.checked;
@@ -98,6 +159,24 @@ function setProgress(pct, label) {
   if (label) $('#progress-label').textContent = label;
 }
 
+// "12 MB of 40 MB · 1.2 MB/s · 25s left", from the last few seconds of progress.
+function transferText(sent, total, samples) {
+  const now = performance.now();
+  samples.push([now, sent]);
+  while (samples.length > 2 && now - samples[0][0] > 5000) samples.shift();
+  const [t0, s0] = samples[0];
+  const speed = now - t0 > 500 ? ((sent - s0) / (now - t0)) * 1000 : 0;
+  if (!speed) return '';
+  const secs = Math.ceil((total - sent) / speed);
+  const eta = secs < 90 ? t('etaSec', { n: secs }) : t('etaMin', { n: Math.ceil(secs / 60) });
+  return t('progressDetail', { done: formatBytes(sent), total: formatBytes(total), speed: formatBytes(Math.round(speed)), eta });
+}
+
+// Keeps a phone screen from locking (which can stop the upload) while files go up.
+async function keepAwake() {
+  try { return await navigator.wakeLock.request('screen'); } catch { return null; }
+}
+
 // Leaving the page would lose an upload that is still running.
 window.addEventListener('beforeunload', (e) => {
   if (!state.upload) return;
@@ -112,8 +191,8 @@ $('#cancel').onclick = () => state.upload && state.upload.abort();
 
 $('#form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const file = state.file;
-  if (!file || state.upload) return;
+  const files = state.files.slice();
+  if (!files.length || state.upload) return;
   const password = $('#use-password').checked ? $('#password').value : '';
   if ($('#use-password').checked && (password.length < 4 || password.length > 100)) {
     $('#error').textContent = t('err_bad_password');
@@ -127,6 +206,7 @@ $('#form').addEventListener('submit', async (e) => {
 
   const controller = new AbortController();
   state.upload = controller;
+  const wakeLock = await keepAwake();
   $('#submit').disabled = true;
   $('#error').textContent = '';
   $('#progress').classList.add('show');
@@ -134,25 +214,37 @@ $('#form').addEventListener('submit', async (e) => {
 
   try {
     const slot = await api('/api/uploads', {
-      name: file.name, size: file.size, type: file.type,
+      files: files.map((f) => ({ name: f.name, size: f.size, type: f.type })),
       expiry: state.expiry, maxDownloads: state.downloads, password,
     }, controller.signal);
 
-    setProgress(0, t('uploading'));
-    await window.blobUpload(slot.pathname, file, {
-      access: 'private',
-      handleUploadUrl: '/api/blob-upload',
-      clientPayload: slot.id,
-      contentType: file.type || undefined,
-      // Bigger files go up in parts; a part that fails on a weak connection is
-      // sent again on its own instead of restarting the whole file.
-      multipart: file.size > 8 * 1024 * 1024,
-      abortSignal: controller.signal,
-      onUploadProgress: (p) => setProgress(p.percentage, p.percentage >= 100 ? t('finishing') : (navigator.onLine ? t('uploading') : t('waitingNet'))),
-    });
+    // One file after another, with one progress bar for all of them.
+    const total = totalBytes();
+    const samples = [];
+    let done = 0;
+    for (const [i, f] of files.entries()) {
+      const step = files.length > 1 ? `${t('fileOfFiles', { i: i + 1, n: files.length })} · ` : '';
+      await window.blobUpload(slot.items[i].pathname, f, {
+        access: 'private',
+        handleUploadUrl: '/api/blob-upload',
+        clientPayload: slot.id,
+        contentType: f.type || undefined,
+        // Bigger files go up in parts; a part that fails on a weak connection is
+        // sent again on its own instead of restarting the whole file.
+        multipart: f.size > 8 * 1024 * 1024,
+        abortSignal: controller.signal,
+        onUploadProgress: (p) => {
+          const sent = done + p.loaded;
+          const detail = navigator.onLine ? (transferText(sent, total, samples) || t('uploading')) : t('waitingNet');
+          setProgress((sent / total) * 100, step + detail);
+        },
+      });
+      done += f.size;
+    }
 
     setProgress(100, t('finishing'));
     const data = await api(`/api/uploads/${slot.id}/complete`, { deleteToken: slot.deleteToken }, controller.signal);
+    data.name = linkLabel(data.files);
     store.set([{ id: data.id, name: data.name, size: data.size, url: data.url, deleteToken: data.deleteToken, expiresAt: data.expiresAt }, ...store.get()]);
     $('#password').value = '';
     showResult(data);
@@ -162,6 +254,7 @@ $('#form').addEventListener('submit', async (e) => {
     $('#submit').disabled = false;
   } finally {
     state.upload = null;
+    if (wakeLock) wakeLock.release().catch(() => {});
     $('#progress').classList.remove('show');
     setProgress(0);
   }
@@ -250,7 +343,8 @@ function reset() {
   clearInterval(state.timer);
   $('#result').classList.remove('show');
   $('#form').style.display = '';
-  setFile(null);
+  state.files = [];
+  renderPicked();
 }
 
 // Returns true once the file is gone. On failure the link and its delete
@@ -276,8 +370,9 @@ async function reopen(item) {
     return renderRecent();
   }
   const data = await r.json();
-  // A protected file comes back without its name; this browser still knows it.
-  showResult({ ...data, name: data.name ?? item.name, size: data.size ?? item.size ?? 0, deleteToken: item.deleteToken });
+  // A protected link comes back without its names; this browser still knows them.
+  const name = data.files ? linkLabel(data.files) : item.name;
+  showResult({ ...data, name, size: data.size ?? item.size ?? 0, deleteToken: item.deleteToken });
   $('.uploader').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -294,7 +389,7 @@ async function renderRecent() {
     row.className = 'recent-row';
     row.innerHTML = `
       <div class="ficon"></div>
-      <div class="meta"><div class="n" dir="auto"></div><div class="s"></div></div>
+      <div class="meta"><div class="n fname" dir="ltr"></div><div class="s"></div></div>
       <button class="btn btn-ghost q" type="button"></button>
       <button class="btn btn-ghost c" type="button"></button>
       <button class="icon-btn d" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>`;

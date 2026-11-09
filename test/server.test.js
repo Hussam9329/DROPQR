@@ -339,3 +339,84 @@ test('download page: link preview shows the file, never a protected one', async 
   assert.match(missing, /Download a file — DropQR/);
   assert.equal((await (await json('GET', `/api/files/${open.id}`)).json()).remaining, 4); // page views are free
 });
+
+// ---------- Stage 4: several files per link ----------
+async function shareMany(files, extra = {}) {
+  const r = await json('POST', '/api/uploads', { files, expiry: '1h', maxDownloads: 2, ...extra });
+  const slot = await r.json();
+  if (r.status !== 201) return { status: r.status, body: slot };
+  for (const [i, it] of slot.items.entries()) blobs.set(it.pathname, { size: files[i].size, contentType: files[i].type });
+  const c = await json('POST', `/api/uploads/${slot.id}/complete`, { deleteToken: slot.deleteToken });
+  return { status: c.status, body: await c.json(), slot };
+}
+
+test('several files share one link; one download gives links to all', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const files = [
+    { name: 'a.jpg', size: 100, type: 'image/jpeg' },
+    { name: 'a.jpg', size: 200, type: 'image/jpeg' }, // same name twice is fine
+    { name: 'notes.pdf', size: 300, type: 'application/pdf' },
+  ];
+  const { status, body, slot } = await shareMany(files);
+  assert.equal(status, 200);
+  assert.equal(new Set(slot.items.map((i) => i.pathname)).size, 3);
+  assert.equal(body.size, 600);
+  assert.deepEqual(body.files.map((f) => [f.idx, f.name, f.size]), [[0, 'a.jpg', 100], [1, 'a.jpg', 200], [2, 'notes.pdf', 300]]);
+
+  const d = await (await json('POST', `/api/files/${body.id}/download`)).json();
+  assert.equal(d.urls.length, 3);
+  assert.equal(d.remaining, 1); // the whole link counted once
+  assert.ok(d.urls.every((u) => new URL(u.url).searchParams.get('download') === '1'));
+  assert.ok(d.urls[2].url.includes('/2/notes.pdf'));
+
+  const html = await (await json('GET', `/f/${body.id}`)).text();
+  assert.ok(html.includes('og:title" content="a.jpg + 2 more"'));
+  assert.ok(html.includes('3 files · 600 B'));
+});
+
+test('several files: limits on count and total size, missing upload', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const many = Array.from({ length: 21 }, (_, i) => ({ name: `${i}.txt`, size: 1 }));
+  const r1 = await json('POST', '/api/uploads', { files: many, expiry: '5m', maxDownloads: 1 });
+  assert.equal((await r1.json()).code, 'too_many_files');
+  const big = [{ name: 'a', size: 60 * 1024 * 1024 }, { name: 'b', size: 60 * 1024 * 1024 }];
+  const r2 = await json('POST', '/api/uploads', { files: big, expiry: '5m', maxDownloads: 1 });
+  assert.equal((await r2.json()).code, 'too_large');
+  const r3 = await json('POST', '/api/uploads', { files: [{ name: 'a', size: 5 }, { name: 'b', size: 0 }], expiry: '5m', maxDownloads: 1 });
+  assert.equal((await r3.json()).code, 'empty_file');
+
+  const slot = await (await json('POST', '/api/uploads', { files: [{ name: 'x', size: 5 }, { name: 'y', size: 6 }], expiry: '5m', maxDownloads: 1 })).json();
+  blobs.set(slot.items[0].pathname, { size: 5 }); // the second file never arrived
+  const c = await json('POST', `/api/uploads/${slot.id}/complete`, { deleteToken: slot.deleteToken });
+  assert.equal((await c.json()).code, 'upload_incomplete');
+});
+
+test('several files: protected names stay hidden; delete and cleanup remove every file', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const { body, slot } = await shareMany([{ name: 'p1.png', size: 10 }, { name: 'p2.png', size: 20 }], { password: 'open-sesame' });
+  const meta = await (await json('GET', `/api/files/${body.id}`)).json();
+  assert.equal(meta.files, null);
+  const unlocked = await (await json('POST', `/api/files/${body.id}/unlock`, { password: 'open-sesame' })).json();
+  assert.equal(unlocked.files.length, 2);
+
+  assert.equal((await json('DELETE', `/api/files/${body.id}`, null, { 'x-delete-token': body.deleteToken })).status, 200);
+  assert.ok(slot.items.every((it) => !blobs.has(it.pathname)));
+  assert.equal((await pg.query('SELECT 1 FROM items WHERE file_id = $1', [body.id])).rows.length, 0);
+
+  const second = await shareMany([{ name: 'q1', size: 1 }, { name: 'q2', size: 2 }]);
+  await pg.query("UPDATE files SET expires_at = now() - interval '1 hour' WHERE id = $1", [second.body.id]);
+  await json('GET', '/api/cron/cleanup', null, { authorization: 'Bearer test-secret' });
+  assert.ok(second.slot.items.every((it) => !blobs.has(it.pathname)));
+});
+
+test('links made before multi-file sharing still work', async () => {
+  await pg.query(`INSERT INTO files (id, pathname, original_name, mime, size, status, expiry_seconds, max_downloads, delete_token, expires_at)
+    VALUES ('oldlink1', 'f/oldlink1/old.pdf', 'old.pdf', 'application/pdf', 42, 'ready', 3600, 3, 'tok', now() + interval '1 hour')`);
+  blobs.set('f/oldlink1/old.pdf', { size: 42 });
+  const meta = await (await json('GET', '/api/files/oldlink1')).json();
+  assert.deepEqual(meta.files, [{ idx: 0, name: 'old.pdf', size: 42, mime: 'application/pdf' }]);
+  const d = await (await json('POST', '/api/files/oldlink1/download')).json();
+  assert.ok(d.url.includes('f/oldlink1/old.pdf'));
+  assert.equal((await json('DELETE', '/api/files/oldlink1', null, { 'x-delete-token': 'tok' })).status, 200);
+  assert.equal(blobs.has('f/oldlink1/old.pdf'), false);
+});

@@ -15,7 +15,9 @@ const scrypt = promisify(crypto.scrypt);
 // ---------- Config ----------
 const PORT = Number(process.env.PORT) || 3000;
 const BASE_URL = (process.env.BASE_URL || '').replace(/\/+$/, '');
+// Limit for one link (all its files together), and how many files it may hold.
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB) || 100;
+const MAX_FILES = 20;
 const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
 // Whole-site storage ceiling and how much one visitor may upload per day.
 const STORAGE_CAP_BYTES = (Number(process.env.STORAGE_CAP_GB) || 5) * 1024 ** 3;
@@ -89,6 +91,16 @@ function ensureSchema() {
       created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
       PRIMARY KEY (file_id, reporter)
     )`);
+    // The files inside each link, in the order they were picked.
+    await query(`CREATE TABLE IF NOT EXISTS items (
+      file_id   TEXT NOT NULL REFERENCES files (id) ON DELETE CASCADE,
+      idx       INTEGER NOT NULL,
+      pathname  TEXT NOT NULL UNIQUE,
+      name      TEXT NOT NULL,
+      size      BIGINT NOT NULL,
+      mime      TEXT NOT NULL,
+      PRIMARY KEY (file_id, idx)
+    )`);
     // Shared counters for rate limits and daily upload quotas, so every server instance sees the same numbers.
     await query(`CREATE TABLE IF NOT EXISTS usage_counters (
       key           TEXT PRIMARY KEY,
@@ -112,8 +124,15 @@ function safeFileName(name) {
   return clean || 'file';
 }
 
-// A protected file shows no name, size or type until the password is given.
-function publicMeta(row, unlocked = false) {
+// The files in a link. Links from before multi-file sharing have one file,
+// stored on the link row itself.
+async function itemsOf(row) {
+  const rows = await query('SELECT idx, pathname, name, size, mime FROM items WHERE file_id = $1 ORDER BY idx', [row.id]);
+  return rows.length ? rows : [{ idx: 0, pathname: row.pathname, name: row.original_name, size: row.size, mime: row.mime }];
+}
+
+// A protected link shows no names, sizes or types until the password is given.
+function publicMeta(row, items, unlocked = false) {
   const hidden = Boolean(row.password_hash) && !unlocked;
   return {
     id: row.id,
@@ -121,6 +140,7 @@ function publicMeta(row, unlocked = false) {
     name: hidden ? null : row.original_name,
     size: hidden ? null : Number(row.size),
     mime: hidden ? null : row.mime,
+    files: hidden ? null : items.map((it) => ({ idx: it.idx, name: it.name, size: Number(it.size), mime: it.mime })),
     createdAt: new Date(row.created_at).getTime(),
     expiresAt: new Date(row.expires_at).getTime(),
     maxDownloads: row.max_downloads,
@@ -197,8 +217,8 @@ function baseUrlFor(req) {
 
 // Storage first: if that fails the row stays, so the delete can be retried.
 async function removeFile(row) {
-  await del(row.pathname);
-  await query('DELETE FROM files WHERE id = $1', [row.id]);
+  await del((await itemsOf(row)).map((it) => it.pathname));
+  await query('DELETE FROM files WHERE id = $1', [row.id]); // its items go with it
 }
 
 // Visitors are counted by a keyed hash of their IP, never the raw address.
@@ -222,17 +242,19 @@ async function addUsage(key, windowSec, amount) {
 // Wraps async handlers so errors reach the error handler.
 const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-// A short-lived link that downloads the file straight from storage.
+// Short-lived links that download files straight from storage.
 // The token is store-wide ("*") because Vercel's scope check garbles non-ASCII
-// (e.g. Arabic) paths. Safe: the link's signature still covers this exact path,
+// (e.g. Arabic) paths. Safe: each link's signature still covers its exact path,
 // and the signing key never leaves the server.
-async function signedDownloadUrl(pathname) {
+async function signedDownloadUrls(items) {
   const validUntil = Date.now() + DOWNLOAD_LINK_MS;
   const token = await issueSignedToken({ pathname: '*', operations: ['get'], validUntil });
-  const { presignedUrl } = await presignUrl(token, { operation: 'get', pathname, validUntil, access: 'private' });
-  const url = new URL(presignedUrl);
-  url.searchParams.set('download', '1'); // save as a file instead of opening it
-  return url.toString();
+  return Promise.all(items.map(async (it) => {
+    const { presignedUrl } = await presignUrl(token, { operation: 'get', pathname: it.pathname, validUntil, access: 'private' });
+    const url = new URL(presignedUrl);
+    url.searchParams.set('download', '1'); // save as a file instead of opening it
+    return { idx: it.idx, url: url.toString() };
+  }));
 }
 
 function sameSecret(given, expected) {
@@ -264,8 +286,10 @@ async function cleanup() {
        OR (status = 'pending' AND created_at <= now() - make_interval(secs => $2))
     LIMIT 500`, [GRACE_MS / 1000, PENDING_TTL_MS / 1000]);
   if (!rows.length) return 0;
+  const ids = rows.map((r) => r.id);
+  const items = await query('SELECT pathname FROM items WHERE file_id = ANY($1)', [ids]);
   // Keep the rows if storage deletion fails, so the next run retries them.
-  await del(rows.map((r) => r.pathname));
+  await del([...new Set([...rows, ...items].map((r) => r.pathname))]);
   await query('DELETE FROM files WHERE id = ANY($1)', [rows.map((r) => r.id)]);
   return rows.length;
 }
@@ -313,6 +337,7 @@ app.get('/api/config', (_req, res) => {
     expiryOptions: Object.keys(EXPIRY_OPTIONS),
     downloadOptions: DOWNLOAD_OPTIONS,
     maxFileMb: MAX_FILE_MB,
+    maxFiles: MAX_FILES,
     reportReasons: REPORT_REASONS,
     abuseEmail: ABUSE_EMAIL,
   });
@@ -323,15 +348,23 @@ app.get('/api/health', h(async (_req, res) => {
   res.json({ ok: true });
 }));
 
-// Step 1: reserve an id and a storage path for the file.
+// Step 1: reserve an id and a storage path for each file.
+// Body: { files: [{ name, size, type }], expiry, maxDownloads, password? }
+// (a single { name, size, type } is still accepted).
 app.post('/api/uploads', uploadLimiter, h(async (req, res) => {
   const { name, size, type, expiry, maxDownloads, password } = req.body || {};
+  const list = Array.isArray(req.body?.files) ? req.body.files : [{ name, size, type }];
   const seconds = EXPIRY_OPTIONS[expiry];
   const max = Number(maxDownloads);
-  const bytes = Number(size);
   if (!seconds || !DOWNLOAD_OPTIONS.includes(max)) return fail(res, 400, 'invalid_options', 'Invalid expiry or download limit.');
-  if (!Number.isSafeInteger(bytes) || bytes <= 0) return fail(res, 400, 'empty_file', 'Empty files cannot be shared.');
-  if (bytes > MAX_FILE_BYTES) return fail(res, 400, 'too_large', `File is larger than ${MAX_FILE_MB} MB.`, { mb: MAX_FILE_MB });
+  if (list.length < 1 || list.length > MAX_FILES) {
+    return fail(res, 400, 'too_many_files', `You can share up to ${MAX_FILES} files at once.`, { max: MAX_FILES });
+  }
+  if (!list.every((f) => Number.isSafeInteger(Number(f?.size)) && Number(f.size) > 0)) {
+    return fail(res, 400, 'empty_file', 'Empty files cannot be shared.');
+  }
+  const bytes = list.reduce((sum, f) => sum + Number(f.size), 0);
+  if (bytes > MAX_FILE_BYTES) return fail(res, 400, 'too_large', `Files are larger than ${MAX_FILE_MB} MB.`, { mb: MAX_FILE_MB });
   const wantsPassword = password !== undefined && password !== null && password !== '';
   if (wantsPassword && (typeof password !== 'string' || password.length < MIN_PASSWORD || password.length > MAX_PASSWORD)) {
     return fail(res, 400, 'bad_password', `The password must be ${MIN_PASSWORD} to ${MAX_PASSWORD} characters.`);
@@ -349,16 +382,31 @@ app.post('/api/uploads', uploadLimiter, h(async (req, res) => {
   }
 
   const id = newId();
-  const fileName = safeFileName(name);
-  const pathname = `f/${id}/${fileName}`;
+  // Each file gets its own folder, so two files with the same name can't clash
+  // and the saved file keeps its real name (the last part of the path).
+  const items = list.map((f, idx) => {
+    const fileName = safeFileName(f.name);
+    return {
+      idx, name: fileName, size: Number(f.size),
+      mime: String(f.type || 'application/octet-stream').slice(0, 200),
+      pathname: `f/${id}/${idx}/${fileName}`,
+    };
+  });
   const deleteToken = newToken();
   const passwordHash = wantsPassword ? await hashPassword(password) : null;
   await query(`INSERT INTO files (id, pathname, original_name, mime, size, expiry_seconds, max_downloads, delete_token, password_hash)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-  [id, pathname, fileName, String(type || 'application/octet-stream').slice(0, 200), bytes, seconds, max, deleteToken, passwordHash]);
+  [id, items[0].pathname, items[0].name, items.length > 1 ? 'multiple' : items[0].mime, bytes, seconds, max, deleteToken, passwordHash]);
+  for (const it of items) {
+    await query('INSERT INTO items (file_id, idx, pathname, name, size, mime) VALUES ($1, $2, $3, $4, $5, $6)',
+      [id, it.idx, it.pathname, it.name, it.size, it.mime]);
+  }
 
   cleanupSoon();
-  res.status(201).json({ id, pathname, deleteToken });
+  res.status(201).json({
+    id, deleteToken, pathname: items[0].pathname,
+    items: items.map((it) => ({ idx: it.idx, pathname: it.pathname })),
+  });
 }));
 
 // Step 2: the browser asks for a one-time token and uploads straight to Blob storage.
@@ -368,10 +416,11 @@ app.post('/api/blob-upload', blobTokenLimiter, h(async (req, res) => {
       body: req.body,
       request: req,
       onBeforeGenerateToken: async (pathname, clientPayload) => {
-        const [row] = await query("SELECT * FROM files WHERE id = $1 AND status = 'pending'", [clientPayload]);
-        if (!row || row.pathname !== pathname) throw new Error('Upload not allowed.');
+        const [item] = await query(`SELECT items.size FROM items JOIN files ON files.id = items.file_id
+          WHERE items.file_id = $1 AND items.pathname = $2 AND files.status = 'pending'`, [clientPayload, pathname]);
+        if (!item) throw new Error('Upload not allowed.');
         return {
-          maximumSizeInBytes: Number(row.size),
+          maximumSizeInBytes: Number(item.size),
           addRandomSuffix: false,
           allowOverwrite: false,
           validUntil: Date.now() + 60 * 60 * 1000,
@@ -393,20 +442,26 @@ app.post('/api/uploads/:id/complete', completeLimiter, h(async (req, res) => {
   if (!row || row.delete_token !== String(req.body?.deleteToken || '')) return res.status(404).json({ error: 'Upload not found.' });
   if (row.status !== 'pending') return res.status(409).json({ error: 'Upload already finished.' });
 
-  const blob = await head(row.pathname).catch(() => null);
-  if (!blob) return fail(res, 400, 'upload_incomplete', 'The file did not finish uploading. Please try again.');
+  const items = await itemsOf(row);
+  const blobs = await Promise.all(items.map((it) => head(it.pathname).catch(() => null)));
+  if (blobs.some((b) => !b)) return fail(res, 400, 'upload_incomplete', 'The file did not finish uploading. Please try again.');
 
+  // Sizes and types as storage actually received them.
+  for (const [i, it] of items.entries()) {
+    await query('UPDATE items SET size = $3, mime = $4 WHERE file_id = $1 AND idx = $2',
+      [row.id, it.idx, blobs[i].size, blobs[i].contentType || it.mime]);
+  }
+  const total = blobs.reduce((sum, b) => sum + Number(b.size), 0);
   const [ready] = await query(`UPDATE files SET status = 'ready', size = $2, mime = $3,
       created_at = now(), expires_at = now() + make_interval(secs => expiry_seconds)
-    WHERE id = $1 AND status = 'pending' RETURNING *`, [row.id, blob.size, blob.contentType || row.mime]);
+    WHERE id = $1 AND status = 'pending' RETURNING *`,
+  [row.id, total, items.length > 1 ? 'multiple' : (blobs[0].contentType || row.mime)]);
   if (!ready) return res.status(409).json({ error: 'Upload already finished.' });
 
-  res.json({ ...publicMeta(ready, true), ...(await shareLink(req, ready.id)), deleteToken: ready.delete_token });
+  res.json({ ...publicMeta(ready, await itemsOf(ready), true), ...(await shareLink(req, ready.id)), deleteToken: ready.delete_token });
 }));
 
-// File details. With ?share=1 it also returns the link and QR code, so the
-// uploader can reopen them from "Your recent links".
-// Loads a file that can still be downloaded, or answers why it can't.
+// Loads a link that can still be downloaded, or answers why it can't.
 async function activeFile(req, res) {
   const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
   if (row?.status === 'blocked') {
@@ -424,17 +479,20 @@ async function activeFile(req, res) {
   return row;
 }
 
+// Link details. With ?share=1 it also returns the link and QR code, so the
+// uploader can reopen them from "Your recent links".
 app.get('/api/files/:id', apiLimiter, h(async (req, res) => {
   const row = await activeFile(req, res);
   if (!row) return;
-  res.json(req.query.share ? { ...publicMeta(row), ...(await shareLink(req, row.id)) } : publicMeta(row));
+  const meta = publicMeta(row, await itemsOf(row));
+  res.json(req.query.share ? { ...meta, ...(await shareLink(req, row.id)) } : meta);
 }));
 
 // A protected file's name, size and type, once the right password is given.
 app.post('/api/files/:id/unlock', apiLimiter, h(async (req, res) => {
   const row = await activeFile(req, res);
   if (!row || !(await checkFilePassword(req, res, row))) return;
-  res.json(publicMeta(row, true));
+  res.json(publicMeta(row, await itemsOf(row), true));
 }));
 
 app.delete('/api/files/:id', apiLimiter, h(async (req, res) => {
@@ -445,10 +503,12 @@ app.delete('/api/files/:id', apiLimiter, h(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// The actual download. Only this POST (sent by the Download button) uses up a
+// The actual download. Only this POST (sent by a Download button) uses up a
 // download, so link previews, mail scanners and opening the page never count.
-// It returns a short-lived signed link, so the file comes straight from storage:
-// no function time limit, and download managers can pause and resume.
+// One download = the whole link: it returns short-lived signed links for every
+// file in it, so the visitor can save one, some or all of them within 15 minutes.
+// Files come straight from storage: no function time limit, and download
+// managers can pause and resume.
 app.post('/api/files/:id/download', downloadLimiter, h(async (req, res) => {
   const file = await activeFile(req, res);
   if (!file || !(await checkFilePassword(req, res, file))) return;
@@ -458,8 +518,8 @@ app.post('/api/files/:id/download', downloadLimiter, h(async (req, res) => {
   if (!row) return fail(res, 410, 'expired', 'This link has expired.');
 
   try {
-    const url = await signedDownloadUrl(row.pathname);
-    res.json({ url, remaining: Math.max(0, row.max_downloads - row.downloads) });
+    const urls = await signedDownloadUrls(await itemsOf(row));
+    res.json({ url: urls[0].url, urls, validFor: DOWNLOAD_LINK_MS, remaining: Math.max(0, row.max_downloads - row.downloads) });
   } catch (err) {
     await query('UPDATE files SET downloads = downloads - 1 WHERE id = $1 AND downloads > 0', [row.id]);
     throw err;
@@ -529,7 +589,7 @@ app.post('/api/admin/files/:id/unblock', h(async (req, res) => {
 }));
 
 app.delete('/api/admin/files/:id', h(async (req, res) => {
-  const [row] = await query('SELECT id, pathname FROM files WHERE id = $1', [req.params.id]);
+  const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
   if (!row) return res.status(404).json({ error: 'File not found.' });
   await removeFile(row);
   res.json({ ok: true });
@@ -537,9 +597,10 @@ app.delete('/api/admin/files/:id', h(async (req, res) => {
 
 // Lets the admin check a reported file without using up its downloads.
 app.post('/api/admin/files/:id/link', h(async (req, res) => {
-  const [row] = await query("SELECT pathname FROM files WHERE id = $1 AND status IN ('ready', 'blocked')", [req.params.id]);
+  const [row] = await query("SELECT * FROM files WHERE id = $1 AND status IN ('ready', 'blocked')", [req.params.id]);
   if (!row) return res.status(404).json({ error: 'File not found.' });
-  res.json({ url: await signedDownloadUrl(row.pathname) });
+  const urls = await signedDownloadUrls(await itemsOf(row));
+  res.json({ url: urls[0].url, urls });
 }));
 
 // Old-style direct links open the download page instead of using up a download.
@@ -565,8 +626,9 @@ app.get('/f/:id', h(async (req, res) => {
     title = 'Protected file — DropQR';
     description = 'This file needs a password. The link expires on its own.';
   } else if (isActive(row)) {
-    title = row.original_name;
-    description = `${formatBytes(Number(row.size))} · Download before the link expires · DropQR`;
+    const count = (await itemsOf(row)).length;
+    title = count > 1 ? `${row.original_name} + ${count - 1} more` : row.original_name;
+    description = `${count > 1 ? `${count} files · ` : ''}${formatBytes(Number(row.size))} · Download before the link expires · DropQR`;
   }
   const base = baseUrlFor(req);
   res.set('Cache-Control', 'no-store');

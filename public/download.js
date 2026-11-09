@@ -2,6 +2,9 @@ const id = decodeURIComponent(location.pathname.split('/').pop());
 const box = $('#box');
 let meta = null;
 let password = ''; // kept only in this page, for protected files
+// Signed links from the last download, valid for a short time. While they are
+// valid, saving more files from this link doesn't use up another download.
+let links = null;
 let timer = null;
 
 // File types that can run programs when opened.
@@ -75,22 +78,26 @@ function renderLocked() {
 }
 
 function render() {
-  document.title = `${meta.name} — DropQR`;
-  const ext = extOf(meta.name).toLowerCase();
+  const files = meta.files;
+  const many = files.length > 1;
+  const first = files[0];
+  document.title = `${many ? t('moreFiles', { name: first.name, n: files.length - 1 }) : first.name} — DropQR`;
   box.innerHTML = `
     <div class="big-icon"></div>
-    <h1 dir="auto"></h1>
+    <h1></h1>
     <p class="sub"></p>
     <div class="stats">
       <div class="stat"><small></small><b id="left">—</b></div>
       <div class="stat"><small></small><b id="dl-left"></b></div>
     </div>
+    <div class="dl-files" id="dl-files" hidden></div>
     <p class="notice warn" id="risky" hidden></p>
     <p class="notice" id="last" hidden></p>
     <button class="btn btn-primary" id="go" type="button">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
       <span></span>
     </button>
+    <p class="saved-hint" id="saved-hint" hidden></p>
     <details class="report">
       <summary></summary>
       <form id="report-form">
@@ -100,25 +107,53 @@ function render() {
         <button class="btn btn-ghost" type="submit"></button>
       </form>
     </details>`;
-  box.querySelector('.big-icon').textContent = ext.slice(0, 4);
-  box.querySelector('h1').textContent = meta.name;
+
+  const exts = files.map((f) => extOf(f.name).toLowerCase());
+  box.querySelector('.big-icon').textContent = many ? String(files.length) : exts[0].slice(0, 4);
+  box.querySelector('h1').textContent = many ? countText(files.length, 'oneFile', 'nFiles', 'nFilesMany') : first.name;
+  if (!many) box.querySelector('h1').dir = 'ltr'; // a file name reads left to right, like in Windows
   // The real type is shown on its own, so a misleading name can't hide it.
-  box.querySelector('.sub').textContent = `${formatBytes(meta.size)} · ⁦.${ext}⁩ · ${t('sharedAgo', { ago: timeAgo(meta.createdAt) })}`;
+  const kind = many ? '' : ` · \u2066.${exts[0]}\u2069`;
+  box.querySelector('.sub').textContent = `${formatBytes(meta.size)}${kind} · ${t('sharedAgo', { ago: timeAgo(meta.createdAt) })}`;
   const [s1, s2] = box.querySelectorAll('.stat small');
   s1.textContent = t('linkExpiresIn');
   s2.textContent = t('downloadsLeft');
-  $('#go span').textContent = t('downloadFile');
-  if (RISKY.has(ext)) {
-    $('#risky').textContent = t('riskyFile', { ext: `⁦.${ext}⁩` });
+  $('#go span').textContent = many ? t('downloadAll', { n: files.length }) : t('downloadFile');
+  $('#saved-hint').textContent = t('savedHint');
+
+  const risky = [...new Set(exts.filter((e) => RISKY.has(e)))];
+  if (risky.length) {
+    $('#risky').textContent = t('riskyFile', { ext: `\u2066${risky.map((e) => `.${e}`).join(' ')}\u2069` });
     $('#risky').hidden = false;
   }
+
+  if (many) {
+    const list = $('#dl-files');
+    list.hidden = false;
+    for (const f of files) {
+      const row = document.createElement('div');
+      row.className = 'dl-file';
+      row.innerHTML = `
+        <div class="ficon"></div>
+        <div class="meta"><div class="n fname" dir="ltr"></div><div class="s"></div></div>
+        <button class="btn btn-ghost" type="button"></button>`;
+      row.querySelector('.ficon').textContent = extOf(f.name).slice(0, 4);
+      row.querySelector('.n').textContent = f.name;
+      row.querySelector('.s').textContent = formatBytes(f.size);
+      const btn = row.querySelector('button');
+      btn.textContent = t('downloadOne');
+      btn.addEventListener('click', () => download([f.idx], btn));
+      list.appendChild(row);
+    }
+  }
+
   box.querySelector('.report summary').textContent = t('reportFile');
   box.querySelector('label[for="report-reason"]').textContent = t('reportQuestion');
   box.querySelector('#report-reason option').textContent = t('chooseReason');
   $('#report-details').placeholder = t('reportDetails');
   box.querySelector('#report-form button').textContent = t('sendReport');
   updateCount();
-  $('#go').addEventListener('click', download);
+  $('#go').addEventListener('click', () => download(files.map((f) => f.idx), $('#go')));
   setUpReport();
   tick();
   clearInterval(timer);
@@ -128,35 +163,65 @@ function render() {
 function updateCount() {
   $('#dl-left').textContent = t('nOfM', { n: meta.remaining, m: meta.maxDownloads });
   $('#last').textContent = t('lastDownload');
-  $('#last').hidden = meta.remaining !== 1;
+  // Once the links are in hand, the remaining files don't need another download.
+  $('#last').hidden = meta.remaining !== 1 || Boolean(links);
 }
 
-// One click = one download: the button stays disabled while the request runs,
-// so a double tap can't use up two downloads.
-async function download() {
-  const btn = $('#go');
+// Uses up one download (only when there are no valid links yet) and returns
+// the signed link of every file in this share.
+async function getLinks() {
+  if (links && links.until > Date.now()) return links.urls;
+  const r = await fetch(`/api/files/${encodeURIComponent(meta.id)}/download`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if ([404, 410, 451].includes(r.status)) {
+    goneFor(r.status);
+    return null;
+  }
+  if (!r.ok) throw new Error(errorText(data, 'downloadFailed'));
+  links = { urls: data.urls || [{ idx: 0, url: data.url }], until: Date.now() + (data.validFor || 15 * 60 * 1000) - 30 * 1000 };
+  meta.remaining = data.remaining;
+  updateCount();
+  return links.urls;
+}
+
+// Saves a file without leaving the page; several files go one after another,
+// because browsers ignore downloads started all at the same moment.
+function save(url, i) {
+  setTimeout(() => {
+    const frame = document.createElement('iframe');
+    frame.hidden = true;
+    frame.src = url;
+    document.body.appendChild(frame);
+    setTimeout(() => frame.remove(), 60 * 1000);
+  }, i * 900);
+}
+
+// One click = one request: the button stays disabled while it runs, so a
+// double tap can't use up two downloads.
+async function download(idxs, btn) {
   if (btn.disabled) return;
   btn.disabled = true;
-  btn.querySelector('span').textContent = t('preparing');
+  const label = btn.querySelector('span') || btn;
+  const before = label.textContent;
+  label.textContent = t('preparing');
   try {
-    const r = await fetch(`/api/files/${encodeURIComponent(meta.id)}/download`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }),
-    });
-    const data = await r.json().catch(() => ({}));
-    if ([404, 410, 451].includes(r.status)) return goneFor(r.status);
-    if (!r.ok) throw new Error(errorText(data, 'downloadFailed'));
-    location.href = data.url; // saved as a file; this page stays open
-    meta.remaining = data.remaining;
-    updateCount();
+    const urls = await getLinks();
+    if (!urls) return;
+    const chosen = urls.filter((u) => idxs.includes(u.idx));
+    if (chosen.length === 1) location.href = chosen[0].url; // saved as a file; this page stays open
+    else chosen.forEach((u, i) => save(u.url, i));
+    $('#saved-hint').hidden = false;
     toast(t('downloadStarted'));
   } catch (err) {
     toast(err.message || t('downloadFailed'));
   }
-  // Short pause before another download can be started.
+  // Short pause before the same button can be pressed again.
   setTimeout(() => {
-    if (!$('#go')) return;
-    btn.querySelector('span').textContent = t('downloadFile');
-    btn.disabled = meta.remaining <= 0;
+    if (!btn.isConnected) return;
+    label.textContent = before;
+    btn.disabled = meta.remaining <= 0 && !(links && links.until > Date.now());
   }, 3000);
 }
 

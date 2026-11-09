@@ -35,6 +35,8 @@
 }
 
 * { box-sizing: border-box; }
+/* "hidden" must win over display rules like grid or flex below. */
+[hidden] { display: none !important; }
 html, body { margin: 0; }
 body {
   font-family: 'Inter', 'IBM Plex Sans Arabic', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
@@ -311,3 +313,23 @@ footer .legal { margin-top: 6px; }
   .recent-row { flex-wrap: wrap; padding: 12px 16px; }
   .recent-row .meta { flex-basis: calc(100% - 48px); }
 }
+
+/* ---------- Stage 4: several files ---------- */
+.picked { display: grid; gap: 8px; }
+.file-list { display: grid; gap: 8px; max-height: 320px; overflow-y: auto; }
+.picked-foot { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 13px; color: var(--muted); }
+.dl-files { display: grid; gap: 8px; margin-top: 16px; text-align: start; }
+.dl-file { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-2); }
+.dl-file .ficon {
+  width: 36px; height: 36px; flex: none; border-radius: 9px; background: var(--accent-soft); color: var(--accent);
+  display: grid; place-items: center; font-size: 10px; font-weight: 700; text-transform: uppercase;
+}
+.dl-file .meta { min-width: 0; flex: 1; }
+.dl-file .n { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dl-file .s { color: var(--muted); font-size: 12px; }
+.dl-file .btn { padding: 8px 12px; font-size: 13px; }
+.saved-hint { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+
+/* File names always read left to right (extension last), also on Arabic pages. */
+.fname { unicode-bidi: isolate; }
+[dir="rtl"] .fname { text-align: right; }

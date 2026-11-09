@@ -12,10 +12,10 @@ Live: https://dropqr-mu.vercel.app
 
 ## How it works
 
-1. `POST /api/uploads` reserves an id and storage path.
+1. `POST /api/uploads` reserves an id and a storage path for each file (up to 20 files per link, `MAX_FILE_MB` in total; table `items`).
 2. The browser uploads directly to Blob (`/api/blob-upload` hands out a one-time token for that exact path only).
 3. `POST /api/uploads/:id/complete` checks the file arrived, starts its timer and returns the link + QR code.
-4. `POST /api/files/:id/download` (sent by the Download button) uses up one download (atomic SQL update) and returns a 15-minute signed storage link, so the file downloads straight from storage and can resume.
+4. `POST /api/files/:id/download` (sent by a Download button) uses up one download (atomic SQL update) and returns 15-minute signed storage links for every file in the link, so the file downloads straight from storage and can resume.
    Opening the share page `/f/:id` (built by the server, with link-preview tags) does **not** use a download.
    A protected file needs its password for `/unlock` and `/download`; wrong guesses are capped per visitor.
 5. Expired / used-up files are deleted from Blob and the database: alongside normal traffic (at most once a minute) and by a daily Vercel Cron job as a safety net.

@@ -46,7 +46,7 @@
       <!-- Upload form -->
       <form id="form" novalidate>
         <label class="dropzone" id="dropzone">
-          <input type="file" id="file">
+          <input type="file" id="file" multiple>
           <div class="icon">
             <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
           </div>
@@ -54,15 +54,12 @@
           <small id="limit-text"></small>
         </label>
 
-        <div class="file-chip" id="chip">
-          <div class="ficon" id="chip-ext">FILE</div>
-          <div class="meta">
-            <div class="name" id="chip-name" dir="auto"></div>
-            <div class="size" id="chip-size"></div>
+        <div class="picked" id="picked" hidden>
+          <div class="file-list" id="file-list"></div>
+          <div class="picked-foot">
+            <button type="button" class="link-btn" id="add-more" data-i18n="addMore"></button>
+            <span id="picked-total"></span>
           </div>
-          <button type="button" class="icon-btn" id="chip-remove" data-i18n-attr="aria-label:removeFile">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-          </button>
         </div>
 
         <div class="field">
