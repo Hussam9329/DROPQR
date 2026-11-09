@@ -5,9 +5,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DropQR — Share files that expire</title>
   <meta name="description" content="Upload a file, get a link and QR code. Set how long it lives and how many times it can be downloaded. No sign-up.">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="DropQR">
+  <meta property="og:title" content="DropQR — Share files that expire">
+  <meta property="og:description" content="Upload a file, get a link and QR code. It deletes itself when time or downloads run out. No sign-up.">
+  <meta property="og:image" content="https://dropqr-mu.vercel.app/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
   <link rel="icon" href="/logo.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -17,8 +26,9 @@
       DropQR
     </a>
     <nav class="nav-links">
-      <a href="#how">How it works</a>
-      <a href="#recent">Your links</a>
+      <a href="#how" data-i18n="navHow"></a>
+      <a href="#recent" data-i18n="navLinks"></a>
+      <button class="btn btn-ghost lang-toggle" type="button"></button>
     </nav>
   </header>
 
@@ -26,10 +36,10 @@
     <section class="hero">
       <span class="pill">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-        No account needed · Auto-deletes
+        <span data-i18n="pill"></span>
       </span>
-      <h1>Share files with a link<br>that <span>expires on its own</span></h1>
-      <p>Upload a file, get a short link and a QR code. You decide how long it lives and how many times it can be downloaded.</p>
+      <h1><span data-i18n="heroTitle1"></span><br><span data-i18n="heroTitle2"></span> <span class="grad" data-i18n="heroTitle3"></span></h1>
+      <p data-i18n="heroText"></p>
     </section>
 
     <section class="card uploader">
@@ -40,40 +50,54 @@
           <div class="icon">
             <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
           </div>
-          <strong>Drop a file here or click to browse</strong>
-          <small id="limit-text">Any file type</small>
+          <strong data-i18n="dropTitle"></strong>
+          <small id="limit-text"></small>
         </label>
 
         <div class="file-chip" id="chip">
           <div class="ficon" id="chip-ext">FILE</div>
           <div class="meta">
-            <div class="name" id="chip-name"></div>
+            <div class="name" id="chip-name" dir="auto"></div>
             <div class="size" id="chip-size"></div>
           </div>
-          <button type="button" class="icon-btn" id="chip-remove" aria-label="Remove file">
+          <button type="button" class="icon-btn" id="chip-remove" data-i18n-attr="aria-label:removeFile">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
           </button>
         </div>
 
         <div class="field">
-          <div class="field-label">Delete after <span id="expiry-hint"></span></div>
-          <div class="chips" id="expiry" role="group" aria-label="Expiry time"></div>
+          <div class="field-label"><span data-i18n="deleteAfter"></span> <span class="hint" id="expiry-hint"></span></div>
+          <div class="chips" id="expiry" role="group" data-i18n-attr="aria-label:deleteAfter"></div>
         </div>
 
         <div class="field">
-          <div class="field-label">Download limit <span id="dl-hint"></span></div>
-          <div class="chips" id="downloads" role="group" aria-label="Download limit"></div>
+          <div class="field-label"><span data-i18n="downloadLimit"></span> <span class="hint" id="dl-hint"></span></div>
+          <div class="chips" id="downloads" role="group" data-i18n-attr="aria-label:downloadLimit"></div>
+        </div>
+
+        <div class="field">
+          <label class="toggle">
+            <input type="checkbox" id="use-password">
+            <span data-i18n="addPassword"></span>
+          </label>
+          <div class="password-box" id="password-box" hidden>
+            <input type="password" id="password" minlength="4" maxlength="100" autocomplete="new-password" data-i18n-attr="placeholder:passwordPlaceholder,aria-label:passwordLabel">
+            <small data-i18n="passwordHint"></small>
+          </div>
         </div>
 
         <button class="btn btn-primary" id="submit" type="submit" disabled>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-          Upload &amp; create link
+          <span data-i18n="uploadBtn"></span>
         </button>
-        <p class="consent">By uploading, you agree to the <a href="/terms.html">Terms</a> and confirm you have the right to share this file.</p>
+        <p class="consent" id="consent"></p>
 
         <div class="progress" id="progress">
-          <div class="bar"><div id="bar"></div></div>
-          <div class="progress-text"><span id="progress-label">Uploading…</span><span id="progress-pct">0%</span></div>
+          <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="bar-wrap"><div id="bar"></div></div>
+          <div class="progress-text">
+            <span id="progress-label"></span>
+            <span><span id="progress-pct">0%</span> · <button type="button" class="link-btn" id="cancel" data-i18n="cancel"></button></span>
+          </div>
         </div>
         <div class="error" id="error" role="alert"></div>
       </form>
@@ -83,8 +107,8 @@
         <div class="result-head">
           <div class="check"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></div>
           <div>
-            <h2>Your link is ready</h2>
-            <p id="result-name"></p>
+            <h2 data-i18n="linkReady"></h2>
+            <p id="result-name" dir="auto"></p>
           </div>
         </div>
 
@@ -92,55 +116,71 @@
           <div class="qr" id="qr"></div>
           <div>
             <div class="link-box">
-              <input id="link" readonly aria-label="Share link">
-              <button class="btn btn-ghost" id="copy" type="button">Copy</button>
+              <input id="link" readonly dir="ltr" data-i18n-attr="aria-label:shareLink">
+              <button class="btn btn-ghost" id="copy" type="button" data-i18n="copy"></button>
             </div>
             <div class="stats">
-              <div class="stat"><small>Expires in</small><b id="r-expires">—</b></div>
-              <div class="stat"><small>Downloads left</small><b id="r-left">—</b></div>
+              <div class="stat"><small data-i18n="expiresIn"></small><b id="r-expires">—</b></div>
+              <div class="stat"><small data-i18n="downloadsLeft"></small><b id="r-left">—</b></div>
+            </div>
+            <div class="share-row">
+              <a class="btn share-btn wa" id="share-wa" target="_blank" rel="noopener">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 0 0-8.6 15.1L2 22l5-1.3A10 10 0 1 0 12 2zm0 18.2a8.2 8.2 0 0 1-4.2-1.2l-.3-.2-3 .8.8-2.9-.2-.3A8.2 8.2 0 1 1 12 20.2zm4.5-6.1c-.2-.1-1.5-.7-1.7-.8s-.4-.1-.6.1-.7.8-.8 1-.3.2-.5.1a6.7 6.7 0 0 1-3.3-2.9c-.3-.4.3-.4.7-1.3.1-.2 0-.3 0-.4l-.8-1.8c-.2-.5-.4-.4-.6-.4h-.5a1 1 0 0 0-.7.3 2.9 2.9 0 0 0-.9 2.2 5 5 0 0 0 1 2.7 11.6 11.6 0 0 0 4.4 3.9c1.6.7 2.3.8 3.1.6a2.6 2.6 0 0 0 1.7-1.2 2.1 2.1 0 0 0 .2-1.2c-.1-.1-.3-.2-.5-.3z"/></svg>
+                <span data-i18n="shareWhatsApp"></span>
+              </a>
+              <a class="btn share-btn tg" id="share-tg" target="_blank" rel="noopener">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M21.9 4.3 18.7 19.4c-.2 1-.9 1.3-1.7.8l-4.8-3.5-2.3 2.2c-.3.3-.5.5-1 .5l.3-4.9 8.9-8c.4-.4-.1-.6-.6-.2L6.5 13.2 1.8 11.7c-1-.3-1-1 .2-1.5L20.6 3c.9-.3 1.6.2 1.3 1.3z"/></svg>
+                <span data-i18n="shareTelegram"></span>
+              </a>
+              <a class="btn share-btn" id="share-mail">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>
+                <span data-i18n="shareEmail"></span>
+              </a>
+              <button class="btn share-btn" id="share" type="button" hidden data-i18n="shareMore"></button>
             </div>
             <div class="row-actions">
-              <button class="btn btn-ghost" id="share" type="button" hidden>Share…</button>
-              <a class="btn btn-ghost" id="qr-dl" download="dropqr-code.png">Save QR</a>
-              <button class="btn btn-danger" id="delete" type="button">Delete now</button>
+              <a class="btn btn-ghost" id="open-page" target="_blank" rel="noopener" data-i18n="openPage"></a>
+              <a class="btn btn-ghost" id="qr-dl" download="dropqr-code.png" data-i18n="saveQr"></a>
+              <button class="btn btn-danger" id="delete" type="button" data-i18n="deleteNow"></button>
             </div>
           </div>
         </div>
 
-        <button class="btn btn-primary" id="again" type="button">Upload another file</button>
+        <button class="btn btn-primary" id="again" type="button" data-i18n="uploadAnother"></button>
       </div>
     </section>
 
     <section class="features" id="how">
       <div class="card feature">
         <div class="ficon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
-        <h3>Timed links</h3>
-        <p>Pick 5 minutes up to 7 days. When time is up, the file is deleted from the server.</p>
+        <h3 data-i18n="feat1Title"></h3>
+        <p data-i18n="feat1Text"></p>
       </div>
       <div class="card feature">
         <div class="ficon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></div>
-        <h3>Download limit</h3>
-        <p>Allow 1, 4, or up to 100 downloads. After the last one, the link stops working.</p>
+        <h3 data-i18n="feat2Title"></h3>
+        <p data-i18n="feat2Text"></p>
       </div>
       <div class="card feature">
         <div class="ficon"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h3v3h-3zM18 18h3v3h-3z"/></svg></div>
-        <h3>QR code</h3>
-        <p>Every link comes with a QR code. Scan it with a phone camera to download straight away.</p>
+        <h3 data-i18n="feat3Title"></h3>
+        <p data-i18n="feat3Text"></p>
       </div>
     </section>
 
-    <section id="recent" style="margin-top:56px; display:none">
-      <h2 style="font-size:20px; margin:0 0 14px">Your recent links <small style="color:var(--muted); font-weight:500; font-size:13px">(saved in this browser only)</small></h2>
-      <div class="card" style="padding:8px 0" id="recent-list"></div>
+    <section class="recent" id="recent" hidden>
+      <h2><span data-i18n="recentTitle"></span> <small data-i18n="recentNote"></small></h2>
+      <div class="card recent-list" id="recent-list"></div>
     </section>
   </main>
 
   <footer>
-    DropQR · Files are deleted automatically when they expire or run out of downloads.
-    <nav class="legal"><a href="/terms.html">Terms</a> · <a href="/privacy.html">Privacy</a><span class="abuse-email"></span></nav>
+    <span data-i18n="footerHome"></span>
+    <nav class="legal"><a href="/terms.html" data-i18n="terms"></a> · <a href="/privacy.html" data-i18n="privacy"></a><span class="abuse-email"></span></nav>
   </footer>
-  <div class="toast" id="toast"></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="/vendor/blob-upload.js"></script>
+  <script src="/i18n.js"></script>
   <script src="/common.js"></script>
   <script src="/app.js"></script>
 </body>

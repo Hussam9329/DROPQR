@@ -71,8 +71,8 @@ const json = (method, url, body, headers = {}) => fetch(base() + url, {
   body: body && JSON.stringify(body),
 });
 
-async function share({ name = 'note.txt', size = 1000, maxDownloads = 4 } = {}) {
-  const r = await json('POST', '/api/uploads', { name, size, type: 'text/plain', expiry: '1h', maxDownloads });
+async function share({ name = 'note.txt', size = 1000, maxDownloads = 4, password } = {}) {
+  const r = await json('POST', '/api/uploads', { name, size, type: 'text/plain', expiry: '1h', maxDownloads, password });
   const res = { status: r.status, body: await r.json() };
   if (r.status !== 201) return res;
   blobs.set(res.body.pathname, { size, contentType: 'text/plain' }); // the browser's direct upload
@@ -208,7 +208,7 @@ test('reports: one per person, file hidden at 3 different people', async () => {
   assert.equal((await report(body.id, '3.3.3.3')).status, 200);
   const gone = await json('GET', `/api/files/${body.id}`);
   assert.equal(gone.status, 451);
-  assert.equal((await json('POST', `/api/files/${body.id}/download`)).status, 410);
+  assert.equal((await json('POST', `/api/files/${body.id}/download`)).status, 451);
   assert.equal((await report(body.id, '4.4.4.4')).status, 404); // already hidden
 });
 
@@ -267,4 +267,75 @@ test('a saved link can be reopened with its QR code', async () => {
   assert.match(d.qrSvg, /^<svg/);
   assert.match(d.qrPng, /^data:image\/png;base64,/);
   assert.equal(d.deleteToken, undefined); // never handed out again
+});
+
+// ---------- Stage 3: password, error codes, download page ----------
+test('password: hidden details, wrong guesses refused, right one works', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const short = await json('POST', '/api/uploads', { name: 'x.txt', size: 10, expiry: '5m', maxDownloads: 1, password: 'abc' });
+  assert.equal(short.status, 400);
+  assert.equal((await short.json()).code, 'bad_password');
+
+  const { status, body } = await share({ name: 'salary.xlsx', password: 'sesame-42' });
+  assert.equal(status, 200);
+  assert.equal(body.name, 'salary.xlsx'); // the uploader sees everything
+  const meta = await (await json('GET', `/api/files/${body.id}`)).json();
+  assert.equal(meta.hasPassword, true);
+  assert.equal(meta.name, null);
+  assert.equal(meta.size, null);
+
+  const wrong = await json('POST', `/api/files/${body.id}/unlock`, { password: 'nope' });
+  assert.equal(wrong.status, 403);
+  assert.equal((await wrong.json()).code, 'wrong_password');
+  assert.equal((await json('POST', `/api/files/${body.id}/download`, { password: 'nope' })).status, 403);
+  assert.equal((await (await json('GET', `/api/files/${body.id}`)).json()).remaining, 4); // nothing used
+
+  const ok = await (await json('POST', `/api/files/${body.id}/unlock`, { password: 'sesame-42' })).json();
+  assert.equal(ok.name, 'salary.xlsx');
+  const dl = await json('POST', `/api/files/${body.id}/download`, { password: 'sesame-42' });
+  assert.equal(dl.status, 200);
+  const row = (await pg.query('SELECT password_hash FROM files WHERE id = $1', [body.id])).rows[0];
+  assert.match(row.password_hash, /^scrypt:/); // never stored as plain text
+  assert.ok(!row.password_hash.includes('sesame'));
+});
+
+test('password guessing is capped per visitor', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const { body } = await share({ password: 'right-one' });
+  const codes = [];
+  for (let i = 0; i < 11; i++) {
+    const r = await json('POST', `/api/files/${body.id}/unlock`, { password: `guess${i}` }, { 'x-real-ip': '9.9.9.9' });
+    codes.push(r.status);
+  }
+  assert.equal(codes.filter((c) => c === 403).length, 10);
+  assert.equal(codes[10], 429);
+  // Even the right password waits now, for this visitor only.
+  assert.equal((await json('POST', `/api/files/${body.id}/unlock`, { password: 'right-one' }, { 'x-real-ip': '9.9.9.9' })).status, 429);
+  assert.equal((await json('POST', `/api/files/${body.id}/unlock`, { password: 'right-one' }, { 'x-real-ip': '8.8.8.8' })).status, 200);
+});
+
+test('errors carry a code for translation', async () => {
+  const r = await json('POST', '/api/uploads', { name: 'x', size: 200 * 1024 * 1024, expiry: '5m', maxDownloads: 1 });
+  const d = await r.json();
+  assert.equal(d.code, 'too_large');
+  assert.equal(d.mb, 100);
+  assert.equal((await (await json('GET', '/api/files/doesnotexist')).json()).code, 'not_found');
+});
+
+test('download page: link preview shows the file, never a protected one', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const open = (await share({ name: 'trip <photos>.zip', size: 5 * 1024 })).body;
+  const html = await (await json('GET', `/f/${open.id}`)).text();
+  assert.ok(html.includes('<meta property="og:title" content="trip &lt;photos&gt;.zip">'));
+  assert.ok(html.includes('og:description" content="5.0 KB · Download before the link expires'));
+  assert.match(html, /og:image" content="http:\/\/127\.0\.0\.1:\d+\/og\.png"/);
+
+  const locked = (await share({ name: 'secret-plan.pdf', password: 'hunter22' })).body;
+  const html2 = await (await json('GET', `/f/${locked.id}`)).text();
+  assert.ok(!html2.includes('secret-plan'));
+  assert.match(html2, /Protected file — DropQR/);
+
+  const missing = await (await json('GET', '/f/nothing00')).text();
+  assert.match(missing, /Download a file — DropQR/);
+  assert.equal((await (await json('GET', `/api/files/${open.id}`)).json()).remaining, 4); // page views are free
 });

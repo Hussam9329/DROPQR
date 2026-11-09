@@ -1,12 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "express",
-  "rewrites": [
-    {
-      "source": "/f/:id",
-      "destination": "/download.html"
-    }
-  ],
   "crons": [
     {
       "path": "/api/cron/cleanup",

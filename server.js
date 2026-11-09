@@ -7,6 +7,10 @@ const { head, del, issueSignedToken, presignUrl } = require('@vercel/blob');
 const { handleUpload } = require('@vercel/blob/client');
 const crypto = require('node:crypto');
 const path = require('node:path');
+const { promisify } = require('node:util');
+const downloadPage = require('./views/download-page');
+
+const scrypt = promisify(crypto.scrypt);
 
 // ---------- Config ----------
 const PORT = Number(process.env.PORT) || 3000;
@@ -75,6 +79,7 @@ function ensureSchema() {
     await query('CREATE INDEX IF NOT EXISTS idx_files_status_expires ON files (status, expires_at)');
     await query('ALTER TABLE files ADD COLUMN IF NOT EXISTS reports INTEGER NOT NULL DEFAULT 0');
     await query('ALTER TABLE files ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ');
+    await query('ALTER TABLE files ADD COLUMN IF NOT EXISTS password_hash TEXT');
     // One row per person per file, so one person can't push a file over the threshold alone.
     await query(`CREATE TABLE IF NOT EXISTS reports (
       file_id     TEXT NOT NULL REFERENCES files (id) ON DELETE CASCADE,
@@ -107,12 +112,15 @@ function safeFileName(name) {
   return clean || 'file';
 }
 
-function publicMeta(row) {
+// A protected file shows no name, size or type until the password is given.
+function publicMeta(row, unlocked = false) {
+  const hidden = Boolean(row.password_hash) && !unlocked;
   return {
     id: row.id,
-    name: row.original_name,
-    size: Number(row.size),
-    mime: row.mime,
+    hasPassword: Boolean(row.password_hash),
+    name: hidden ? null : row.original_name,
+    size: hidden ? null : Number(row.size),
+    mime: hidden ? null : row.mime,
     createdAt: new Date(row.created_at).getTime(),
     expiresAt: new Date(row.expires_at).getTime(),
     maxDownloads: row.max_downloads,
@@ -120,6 +128,50 @@ function publicMeta(row) {
     remaining: Math.max(0, row.max_downloads - row.downloads),
     serverNow: Date.now(),
   };
+}
+
+// Errors carry a stable code so the page can show them in the visitor's language.
+function fail(res, status, code, error, extra = {}) {
+  return res.status(status).json({ error, code, ...extra });
+}
+
+const MIN_PASSWORD = 4;
+const MAX_PASSWORD = 100;
+
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const hash = await scrypt(password, salt, 32);
+  return `scrypt:${salt.toString('base64')}:${hash.toString('base64')}`;
+}
+
+async function passwordMatches(password, stored) {
+  const [, salt, hash] = String(stored).split(':');
+  const given = await scrypt(String(password), Buffer.from(salt, 'base64'), 32);
+  return crypto.timingSafeEqual(given, Buffer.from(hash, 'base64'));
+}
+
+// For a protected file: true if the password is right. Wrong guesses are
+// limited per visitor and file, so a password can't be guessed by brute force.
+async function checkFilePassword(req, res, row) {
+  if (!row.password_hash) return true;
+  const tries = await addUsage(`pw:${row.id}:${visitorKey(req)}`, 15 * 60, 1);
+  if (tries > 10) {
+    fail(res, 429, 'too_many_attempts', 'Too many wrong passwords. Please wait 15 minutes.');
+    return false;
+  }
+  if (!(await passwordMatches(req.body?.password || '', row.password_hash))) {
+    fail(res, 403, 'wrong_password', 'Wrong password.');
+    return false;
+  }
+  return true;
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  const u = ['KB', 'MB', 'GB'];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return `${n.toFixed(n < 10 ? 1 : 0)} ${u[i]}`;
 }
 
 // The public link plus its QR code (SVG for the page, PNG for saving).
@@ -194,7 +246,7 @@ function limit(bucket, windowSec, max) {
     const hits = await addUsage(`${bucket}:${visitorKey(req)}`, windowSec, 1);
     if (hits <= max) return next();
     res.set('Retry-After', String(windowSec));
-    res.status(429).json({ error: 'Too many requests. Please wait a little and try again.' });
+    fail(res, 429, 'rate_limited', 'Too many requests. Please wait a little and try again.');
   });
 }
 
@@ -273,32 +325,37 @@ app.get('/api/health', h(async (_req, res) => {
 
 // Step 1: reserve an id and a storage path for the file.
 app.post('/api/uploads', uploadLimiter, h(async (req, res) => {
-  const { name, size, type, expiry, maxDownloads } = req.body || {};
+  const { name, size, type, expiry, maxDownloads, password } = req.body || {};
   const seconds = EXPIRY_OPTIONS[expiry];
   const max = Number(maxDownloads);
   const bytes = Number(size);
-  if (!seconds || !DOWNLOAD_OPTIONS.includes(max)) return res.status(400).json({ error: 'Invalid expiry or download limit.' });
-  if (!Number.isSafeInteger(bytes) || bytes <= 0) return res.status(400).json({ error: 'Empty files cannot be shared.' });
-  if (bytes > MAX_FILE_BYTES) return res.status(400).json({ error: `File is larger than ${MAX_FILE_MB} MB.` });
+  if (!seconds || !DOWNLOAD_OPTIONS.includes(max)) return fail(res, 400, 'invalid_options', 'Invalid expiry or download limit.');
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) return fail(res, 400, 'empty_file', 'Empty files cannot be shared.');
+  if (bytes > MAX_FILE_BYTES) return fail(res, 400, 'too_large', `File is larger than ${MAX_FILE_MB} MB.`, { mb: MAX_FILE_MB });
+  const wantsPassword = password !== undefined && password !== null && password !== '';
+  if (wantsPassword && (typeof password !== 'string' || password.length < MIN_PASSWORD || password.length > MAX_PASSWORD)) {
+    return fail(res, 400, 'bad_password', `The password must be ${MIN_PASSWORD} to ${MAX_PASSWORD} characters.`);
+  }
 
   // Unfinished reservations count too, so storage can't be filled by starting many uploads.
   const [{ used }] = await query("SELECT COALESCE(SUM(size), 0) AS used FROM files WHERE status IN ('pending', 'ready')");
   if (Number(used) + bytes > STORAGE_CAP_BYTES) {
-    return res.status(503).json({ error: 'The service is full right now. Please try again later.' });
+    return fail(res, 503, 'service_full', 'The service is full right now. Please try again later.');
   }
   const quotaKey = `bytes:${visitorKey(req)}`;
   if (await addUsage(quotaKey, 24 * 60 * 60, bytes) > DAILY_UPLOAD_BYTES) {
     await addUsage(quotaKey, 24 * 60 * 60, -bytes); // a refused upload doesn't use up the quota
-    return res.status(429).json({ error: "You reached today's upload limit. Please try again tomorrow." });
+    return fail(res, 429, 'daily_limit', "You reached today's upload limit. Please try again tomorrow.");
   }
 
   const id = newId();
   const fileName = safeFileName(name);
   const pathname = `f/${id}/${fileName}`;
   const deleteToken = newToken();
-  await query(`INSERT INTO files (id, pathname, original_name, mime, size, expiry_seconds, max_downloads, delete_token)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-  [id, pathname, fileName, String(type || 'application/octet-stream').slice(0, 200), bytes, seconds, max, deleteToken]);
+  const passwordHash = wantsPassword ? await hashPassword(password) : null;
+  await query(`INSERT INTO files (id, pathname, original_name, mime, size, expiry_seconds, max_downloads, delete_token, password_hash)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+  [id, pathname, fileName, String(type || 'application/octet-stream').slice(0, 200), bytes, seconds, max, deleteToken, passwordHash]);
 
   cleanupSoon();
   res.status(201).json({ id, pathname, deleteToken });
@@ -325,7 +382,8 @@ app.post('/api/blob-upload', blobTokenLimiter, h(async (req, res) => {
     });
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message || 'Upload failed.' });
+    console.error('blob upload token refused', err);
+    fail(res, 400, 'upload_failed', 'Upload failed. Please try again.');
   }
 }));
 
@@ -336,26 +394,47 @@ app.post('/api/uploads/:id/complete', completeLimiter, h(async (req, res) => {
   if (row.status !== 'pending') return res.status(409).json({ error: 'Upload already finished.' });
 
   const blob = await head(row.pathname).catch(() => null);
-  if (!blob) return res.status(400).json({ error: 'The file did not finish uploading. Please try again.' });
+  if (!blob) return fail(res, 400, 'upload_incomplete', 'The file did not finish uploading. Please try again.');
 
   const [ready] = await query(`UPDATE files SET status = 'ready', size = $2, mime = $3,
       created_at = now(), expires_at = now() + make_interval(secs => expiry_seconds)
     WHERE id = $1 AND status = 'pending' RETURNING *`, [row.id, blob.size, blob.contentType || row.mime]);
   if (!ready) return res.status(409).json({ error: 'Upload already finished.' });
 
-  res.json({ ...publicMeta(ready), ...(await shareLink(req, ready.id)), deleteToken: ready.delete_token });
+  res.json({ ...publicMeta(ready, true), ...(await shareLink(req, ready.id)), deleteToken: ready.delete_token });
 }));
 
 // File details. With ?share=1 it also returns the link and QR code, so the
 // uploader can reopen them from "Your recent links".
-app.get('/api/files/:id', apiLimiter, h(async (req, res) => {
+// Loads a file that can still be downloaded, or answers why it can't.
+async function activeFile(req, res) {
   const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
   if (row?.status === 'blocked') {
-    return res.status(451).json({ error: 'This file was removed after being reported as harmful.' });
+    fail(res, 451, 'removed', 'This file was removed after being reported as harmful.');
+    return null;
   }
-  if (!row || row.status !== 'ready') return res.status(404).json({ error: 'This link does not exist or was removed.' });
-  if (!isActive(row)) return res.status(410).json({ error: 'This link has expired.' });
+  if (!row || row.status !== 'ready') {
+    fail(res, 404, 'not_found', 'This link does not exist or was removed.');
+    return null;
+  }
+  if (!isActive(row)) {
+    fail(res, 410, 'expired', 'This link has expired.');
+    return null;
+  }
+  return row;
+}
+
+app.get('/api/files/:id', apiLimiter, h(async (req, res) => {
+  const row = await activeFile(req, res);
+  if (!row) return;
   res.json(req.query.share ? { ...publicMeta(row), ...(await shareLink(req, row.id)) } : publicMeta(row));
+}));
+
+// A protected file's name, size and type, once the right password is given.
+app.post('/api/files/:id/unlock', apiLimiter, h(async (req, res) => {
+  const row = await activeFile(req, res);
+  if (!row || !(await checkFilePassword(req, res, row))) return;
+  res.json(publicMeta(row, true));
 }));
 
 app.delete('/api/files/:id', apiLimiter, h(async (req, res) => {
@@ -371,10 +450,12 @@ app.delete('/api/files/:id', apiLimiter, h(async (req, res) => {
 // It returns a short-lived signed link, so the file comes straight from storage:
 // no function time limit, and download managers can pause and resume.
 app.post('/api/files/:id/download', downloadLimiter, h(async (req, res) => {
+  const file = await activeFile(req, res);
+  if (!file || !(await checkFilePassword(req, res, file))) return;
   const [row] = await query(`UPDATE files SET downloads = downloads + 1, last_download_at = now()
     WHERE id = $1 AND status = 'ready' AND downloads < max_downloads AND expires_at > now()
-    RETURNING *`, [req.params.id]);
-  if (!row) return res.status(410).json({ error: 'This link has expired.' });
+    RETURNING *`, [file.id]);
+  if (!row) return fail(res, 410, 'expired', 'This link has expired.');
 
   try {
     const url = await signedDownloadUrl(row.pathname);
@@ -389,10 +470,10 @@ app.post('/api/files/:id/download', downloadLimiter, h(async (req, res) => {
 // reports the file is hidden until an admin reviews it.
 app.post('/api/files/:id/report', reportLimiter, h(async (req, res) => {
   const reason = String(req.body?.reason || '');
-  if (!Object.hasOwn(REPORT_REASONS, reason)) return res.status(400).json({ error: 'Please choose a reason.' });
+  if (!Object.hasOwn(REPORT_REASONS, reason)) return fail(res, 400, 'report_reason', 'Please choose a reason.');
   const details = String(req.body?.details || '').trim().slice(0, 1000);
   const [row] = await query("SELECT id FROM files WHERE id = $1 AND status = 'ready'", [req.params.id]);
-  if (!row) return res.status(404).json({ error: 'This link does not exist or was removed.' });
+  if (!row) return fail(res, 404, 'not_found', 'This link does not exist or was removed.');
 
   const added = await query(`INSERT INTO reports (file_id, reporter, reason, details) VALUES ($1, $2, $3, $4)
     ON CONFLICT DO NOTHING RETURNING file_id`, [row.id, visitorKey(req), reason, details]);
@@ -473,8 +554,26 @@ app.get('/api/cron/cleanup', h(async (req, res) => {
   res.json({ deleted: total });
 }));
 
-// Local development only: on Vercel these are served by the CDN / vercel.json.
-app.get('/f/:id', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'download.html')));
+// The download page. Chat apps read its title and picture for the link preview;
+// a protected file never shows its name there.
+app.get('/f/:id', h(async (req, res) => {
+  await ensureSchema();
+  const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
+  let title = 'Download a file — DropQR';
+  let description = 'A file shared with DropQR. The link expires on its own.';
+  if (isActive(row) && row.password_hash) {
+    title = 'Protected file — DropQR';
+    description = 'This file needs a password. The link expires on its own.';
+  } else if (isActive(row)) {
+    title = row.original_name;
+    description = `${formatBytes(Number(row.size))} · Download before the link expires · DropQR`;
+  }
+  const base = baseUrlFor(req);
+  res.set('Cache-Control', 'no-store');
+  res.type('html').send(downloadPage({ title, description, url: `${base}/f/${req.params.id}`, image: `${base}/og.png` }));
+}));
+
+// Local development only: on Vercel the CDN serves public/.
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 const NOT_FOUND_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Not found — DropQR</title><link rel="stylesheet" href="/styles.css"></head><body><main>

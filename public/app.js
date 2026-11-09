@@ -1,9 +1,4 @@
-const EXPIRY_LABELS = {
-  '5m': '5 min', '10m': '10 min', '30m': '30 min', '1h': '1 hour', '6h': '6 hours',
-  '12h': '12 hours', '1d': '1 day', '3d': '3 days', '7d': '7 days',
-};
-
-const state = { file: null, expiry: '1h', downloads: 4, maxBytes: Infinity, current: null, timer: null };
+const state = { file: null, expiry: '1h', downloads: 4, maxBytes: Infinity, current: null, timer: null, upload: null };
 
 // ---------- Option chips ----------
 function renderChips(container, values, label, selected, onPick) {
@@ -24,16 +19,30 @@ function renderChips(container, values, label, selected, onPick) {
 }
 
 function updateHints() {
-  $('#expiry-hint').textContent = EXPIRY_LABELS[state.expiry];
-  $('#dl-hint').textContent = state.downloads === 1 ? '1 download' : `${state.downloads} downloads`;
+  $('#expiry-hint').textContent = t(`exp_${state.expiry}`);
+  $('#dl-hint').textContent = countText(state.downloads, 'oneDownload', 'nDownloads', 'nDownloadsMany');
 }
 
+// The consent line has a link in the middle, so it is built from parts.
+(() => {
+  const [before, after] = t('consent', { terms: '\u0000' }).split('\u0000');
+  const a = document.createElement('a');
+  a.href = '/terms.html';
+  a.textContent = t('terms');
+  $('#consent').replaceChildren(before, a, after || '');
+})();
+
 configReady.then((cfg) => {
+  if (!cfg.expiryOptions) {
+    $('#error').textContent = t('configError');
+    return;
+  }
   state.maxBytes = cfg.maxFileMb * 1024 * 1024;
-  $('#limit-text').textContent = `Any file type · up to ${cfg.maxFileMb} MB`;
-  renderChips($('#expiry'), cfg.expiryOptions, (v) => EXPIRY_LABELS[v] || v, state.expiry, (v) => { state.expiry = v; updateHints(); });
-  renderChips($('#downloads'), cfg.downloadOptions, (v) => (v === 1 ? '1 time' : `${v} times`), state.downloads, (v) => { state.downloads = v; updateHints(); });
+  $('#limit-text').textContent = t('dropLimit', { mb: cfg.maxFileMb });
+  renderChips($('#expiry'), cfg.expiryOptions, (v) => t(`exp_${v}`), state.expiry, (v) => { state.expiry = v; updateHints(); });
+  renderChips($('#downloads'), cfg.downloadOptions, (v) => countText(v, 'oneTime', 'nTimes', 'nTimesMany'), state.downloads, (v) => { state.downloads = v; updateHints(); });
   updateHints();
+  if (state.file) $('#submit').disabled = false;
 });
 
 // ---------- File picking ----------
@@ -43,13 +52,13 @@ const input = $('#file');
 function setFile(f) {
   $('#error').textContent = '';
   if (f && f.size > state.maxBytes) {
-    $('#error').textContent = `That file is ${formatBytes(f.size)} — the limit is ${formatBytes(state.maxBytes)}.`;
+    $('#error').textContent = t('tooBig', { size: formatBytes(f.size), max: formatBytes(state.maxBytes) });
     f = null;
   }
   state.file = f || null;
   $('#chip').classList.toggle('show', !!f);
   dz.style.display = f ? 'none' : '';
-  $('#submit').disabled = !f;
+  $('#submit').disabled = !f || state.maxBytes === Infinity;
   if (f) {
     $('#chip-name').textContent = f.name;
     $('#chip-size').textContent = formatBytes(f.size);
@@ -66,58 +75,93 @@ $('#chip-remove').onclick = () => setFile(null);
 dz.addEventListener('drop', (ev) => setFile(ev.dataTransfer.files[0]));
 // Allow dropping anywhere on the page
 window.addEventListener('dragover', (e) => e.preventDefault());
-window.addEventListener('drop', (e) => { e.preventDefault(); if (!state.current && e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
+window.addEventListener('drop', (e) => { e.preventDefault(); if (!state.current && !state.upload && e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
+
+$('#use-password').addEventListener('change', (e) => {
+  $('#password-box').hidden = !e.target.checked;
+  if (e.target.checked) $('#password').focus();
+});
 
 // ---------- Upload ----------
 // 1) reserve a slot  2) upload straight to Blob storage  3) confirm and get the link
-async function api(url, body) {
-  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+async function api(url, body, signal) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || 'Upload failed. Please try again.');
+  if (!r.ok) throw new Error(errorText(data, 'uploadFailed'));
   return data;
 }
 
 function setProgress(pct, label) {
   $('#bar').style.width = pct + '%';
+  $('#bar-wrap').setAttribute('aria-valuenow', String(Math.round(pct)));
   $('#progress-pct').textContent = Math.round(pct) + '%';
   if (label) $('#progress-label').textContent = label;
 }
 
+// Leaving the page would lose an upload that is still running.
+window.addEventListener('beforeunload', (e) => {
+  if (!state.upload) return;
+  e.preventDefault();
+  e.returnValue = t('leaveWarning');
+});
+// On a weak connection, say so instead of looking frozen; the upload retries by itself.
+window.addEventListener('offline', () => { if (state.upload) $('#progress-label').textContent = t('waitingNet'); });
+window.addEventListener('online', () => { if (state.upload) $('#progress-label').textContent = t('uploading'); });
+
+$('#cancel').onclick = () => state.upload && state.upload.abort();
+
 $('#form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const file = state.file;
-  if (!file) return;
+  if (!file || state.upload) return;
+  const password = $('#use-password').checked ? $('#password').value : '';
+  if ($('#use-password').checked && (password.length < 4 || password.length > 100)) {
+    $('#error').textContent = t('err_bad_password');
+    $('#password').focus();
+    return;
+  }
+  if (!navigator.onLine) {
+    $('#error').textContent = t('offline');
+    return;
+  }
 
+  const controller = new AbortController();
+  state.upload = controller;
   $('#submit').disabled = true;
   $('#error').textContent = '';
   $('#progress').classList.add('show');
-  setProgress(0, 'Preparing…');
+  setProgress(0, t('preparing'));
 
   try {
     const slot = await api('/api/uploads', {
       name: file.name, size: file.size, type: file.type,
-      expiry: state.expiry, maxDownloads: state.downloads,
-    });
+      expiry: state.expiry, maxDownloads: state.downloads, password,
+    }, controller.signal);
 
-    setProgress(0, 'Uploading…');
+    setProgress(0, t('uploading'));
     await window.blobUpload(slot.pathname, file, {
       access: 'private',
       handleUploadUrl: '/api/blob-upload',
       clientPayload: slot.id,
       contentType: file.type || undefined,
-      multipart: file.size > 50 * 1024 * 1024,
-      onUploadProgress: (p) => setProgress(p.percentage, p.percentage >= 100 ? 'Finishing…' : 'Uploading…'),
+      // Bigger files go up in parts; a part that fails on a weak connection is
+      // sent again on its own instead of restarting the whole file.
+      multipart: file.size > 8 * 1024 * 1024,
+      abortSignal: controller.signal,
+      onUploadProgress: (p) => setProgress(p.percentage, p.percentage >= 100 ? t('finishing') : (navigator.onLine ? t('uploading') : t('waitingNet'))),
     });
 
-    setProgress(100, 'Finishing…');
-    const data = await api(`/api/uploads/${slot.id}/complete`, { deleteToken: slot.deleteToken });
-    store.set([{ id: data.id, name: data.name, url: data.url, deleteToken: data.deleteToken, expiresAt: data.expiresAt }, ...store.get()]);
+    setProgress(100, t('finishing'));
+    const data = await api(`/api/uploads/${slot.id}/complete`, { deleteToken: slot.deleteToken }, controller.signal);
+    store.set([{ id: data.id, name: data.name, size: data.size, url: data.url, deleteToken: data.deleteToken, expiresAt: data.expiresAt }, ...store.get()]);
+    $('#password').value = '';
     showResult(data);
     renderRecent();
   } catch (err) {
-    $('#error').textContent = err.message || 'Upload failed. Please try again.';
+    $('#error').textContent = controller.signal.aborted ? t('uploadCancelled') : (err.message || t('uploadFailed'));
     $('#submit').disabled = false;
   } finally {
+    state.upload = null;
     $('#progress').classList.remove('show');
     setProgress(0);
   }
@@ -133,12 +177,23 @@ function showResult(data) {
   $('#qr').innerHTML = data.qrSvg; // generated by our own server
   $('#qr-dl').href = data.qrPng;
   $('#link').value = data.url;
-  $('#r-left').textContent = `${data.remaining} of ${data.maxDownloads}`;
-  $('#share').hidden = !navigator.share;
+  $('#open-page').href = data.url;
+  $('#r-left').textContent = t('nOfM', { n: data.remaining, m: data.maxDownloads });
+  setShareLinks(data);
   tick();
   clearInterval(state.timer);
   state.timer = setInterval(tick, 1000);
   pollStats();
+}
+
+// WhatsApp, Telegram and email work everywhere; "More…" opens the phone's own share menu.
+function setShareLinks(data) {
+  // A protected file's name stays out of the message too.
+  const text = data.hasPassword ? t('shareTextLocked') : t('shareText', { name: data.name });
+  $('#share-wa').href = `https://wa.me/?text=${encodeURIComponent(`${text} ${data.url}`)}`;
+  $('#share-tg').href = `https://t.me/share/url?url=${encodeURIComponent(data.url)}&text=${encodeURIComponent(text)}`;
+  $('#share-mail').href = `mailto:?subject=${encodeURIComponent(data.hasPassword ? 'DropQR' : data.name)}&body=${encodeURIComponent(`${text}\n${data.url}`)}`;
+  $('#share').hidden = !navigator.share;
 }
 
 function tick() {
@@ -156,10 +211,10 @@ async function pollStats() {
     if (r.ok) {
       const m = await r.json();
       syncClock(m);
-      $('#r-left').textContent = `${m.remaining} of ${m.maxDownloads}`;
+      $('#r-left').textContent = t('nOfM', { n: m.remaining, m: m.maxDownloads });
     } else {
-      $('#r-left').textContent = '0 — link expired';
-      $('#r-expires').textContent = 'Expired';
+      $('#r-left').textContent = t('expiredLeft');
+      $('#r-expires').textContent = t('expired');
       clearInterval(state.timer);
       return;
     }
@@ -167,16 +222,24 @@ async function pollStats() {
   setTimeout(pollStats, 4000);
 }
 
-$('#copy').onclick = async () => {
-  try { await navigator.clipboard.writeText($('#link').value); }
-  catch { $('#link').select(); document.execCommand('copy'); }
-  toast('Link copied');
-};
-$('#share').onclick = () => navigator.share({ title: state.current.name, url: state.current.url }).catch(() => {});
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const tmp = Object.assign(document.createElement('textarea'), { value: text });
+    document.body.appendChild(tmp);
+    tmp.select();
+    document.execCommand('copy');
+    tmp.remove();
+  }
+  toast(t('linkCopied'));
+}
+
+$('#copy').onclick = () => copyText($('#link').value);
+$('#share').onclick = () => navigator.share({ title: state.current.hasPassword ? 'DropQR' : state.current.name, url: state.current.url }).catch(() => {});
 $('#link').onclick = (e) => e.target.select();
 
 $('#delete').onclick = async () => {
-  if (!state.current || !confirm('Delete this file now? The link will stop working.')) return;
+  if (!state.current || !confirm(t('confirmDelete'))) return;
   if (await deleteLink(state.current.id, state.current.deleteToken)) reset();
 };
 
@@ -195,24 +258,26 @@ function reset() {
 async function deleteLink(id, token) {
   const r = await fetch(`/api/files/${id}`, { method: 'DELETE', headers: { 'X-Delete-Token': token } }).catch(() => null);
   if (!r || (!r.ok && r.status !== 404)) {
-    toast('Could not delete the file. Please try again.');
+    toast(t('deleteFailed'));
     return false;
   }
   store.set(store.get().filter((x) => x.id !== id));
   renderRecent();
-  toast('File deleted');
+  toast(t('deleted'));
   return true;
 }
 
 // Shows a saved link's card again: QR code, link, time and downloads left.
 async function reopen(item) {
   const r = await fetch(`/api/files/${encodeURIComponent(item.id)}?share=1`).catch(() => null);
-  if (!r) return toast('Could not reach the server. Please try again.');
+  if (!r) return toast(t('noServer'));
   if (!r.ok) {
-    toast('This link has expired.');
+    toast(t('err_expired'));
     return renderRecent();
   }
-  showResult({ ...(await r.json()), deleteToken: item.deleteToken });
+  const data = await r.json();
+  // A protected file comes back without its name; this browser still knows it.
+  showResult({ ...data, name: data.name ?? item.name, size: data.size ?? item.size ?? 0, deleteToken: item.deleteToken });
   $('.uploader').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -221,36 +286,36 @@ async function renderRecent() {
   const list = store.get().filter((x) => x.expiresAt > nowMs());
   store.set(list);
   const box = $('#recent-list');
-  $('#recent').style.display = list.length ? '' : 'none';
+  $('#recent').hidden = !list.length;
   box.innerHTML = '';
 
   for (const item of list) {
     const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:12px 20px;border-bottom:1px solid var(--border)';
+    row.className = 'recent-row';
     row.innerHTML = `
-      <div class="ficon" style="width:36px;height:36px;border-radius:9px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;font-size:10px;font-weight:700;text-transform:uppercase;flex:none"></div>
-      <div style="min-width:0;flex:1">
-        <div class="n" style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
-        <div class="s" style="color:var(--muted);font-size:13px">Loading…</div>
-      </div>
-      <button class="btn btn-ghost q" style="padding:8px 12px;font-size:13px">QR</button>
-      <button class="btn btn-ghost c" style="padding:8px 12px;font-size:13px">Copy</button>
-      <button class="icon-btn d" aria-label="Delete"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>`;
+      <div class="ficon"></div>
+      <div class="meta"><div class="n" dir="auto"></div><div class="s"></div></div>
+      <button class="btn btn-ghost q" type="button"></button>
+      <button class="btn btn-ghost c" type="button"></button>
+      <button class="icon-btn d" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>`;
     row.querySelector('.ficon').textContent = extOf(item.name).slice(0, 4);
     row.querySelector('.n').textContent = item.name;
+    row.querySelector('.s').textContent = t('loading');
+    row.querySelector('.q').textContent = t('qr');
+    row.querySelector('.c').textContent = t('copy');
+    row.querySelector('.d').setAttribute('aria-label', t('deleteLabel'));
     row.querySelector('.q').onclick = () => reopen(item);
-    row.querySelector('.c').onclick = () => navigator.clipboard.writeText(item.url).then(() => toast('Link copied'));
-    row.querySelector('.d').onclick = () => confirm(`Delete "${item.name}"?`) && deleteLink(item.id, item.deleteToken);
+    row.querySelector('.c').onclick = () => copyText(item.url);
+    row.querySelector('.d').onclick = () => confirm(t('confirmDeleteNamed', { name: item.name })) && deleteLink(item.id, item.deleteToken);
     box.appendChild(row);
 
     fetch(`/api/files/${item.id}`).then(async (r) => {
       const s = row.querySelector('.s');
-      if (!r.ok) { s.textContent = 'Expired'; return; }
+      if (!r.ok) { s.textContent = t('expired'); return; }
       const m = await r.json();
       syncClock(m);
-      s.textContent = `${m.downloads}/${m.maxDownloads} downloads · expires in ${formatLeft(m.expiresAt - nowMs())}`;
+      s.textContent = t('recentStats', { d: m.downloads, m: m.maxDownloads, left: formatLeft(m.expiresAt - nowMs()) });
     }).catch(() => {});
   }
-  if (box.lastElementChild) box.lastElementChild.style.borderBottom = '0';
 }
 renderRecent();

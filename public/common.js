@@ -1,7 +1,12 @@
 // Shared helpers for both pages.
 const $ = (s) => document.querySelector(s);
 
+// Wrapped in direction isolates so "2.0 MB" never flips inside Arabic text.
 function formatBytes(n) {
+  return `⁦${formatSize(n)}⁩`;
+}
+
+function formatSize(n) {
   if (n < 1024) return `${n} B`;
   const u = ['KB', 'MB', 'GB'];
   let i = -1;
@@ -10,11 +15,11 @@ function formatBytes(n) {
 }
 
 function formatLeft(ms) {
-  if (ms <= 0) return 'Expired';
+  if (ms <= 0) return t('expired');
   const s = Math.floor(ms / 1000);
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-  if (d) return `${d}d ${h}h`;
-  if (h) return `${h}h ${m}m`;
+  if (d) return `${d}${t('unitD')} ${h}${t('unitH')}`;
+  if (h) return `${h}${t('unitH')} ${m}${t('unitM')}`;
   return `${m}:${String(sec).padStart(2, '0')}`;
 }
 
@@ -51,7 +56,14 @@ configReady.then((cfg) => {
     const inFooter = !!el.closest('.legal');
     const a = document.createElement('a');
     a.href = `mailto:${cfg.abuseEmail}`;
-    a.textContent = inFooter ? 'Report abuse' : cfg.abuseEmail;
+    a.textContent = inFooter ? t('reportAbuse') : cfg.abuseEmail;
     el.replaceChildren(inFooter ? ' · ' : '', a);
   });
+});
+
+// Translate the page, and wire the language switch.
+applyI18n();
+document.querySelectorAll('.lang-toggle').forEach((b) => {
+  b.textContent = t('switchLang');
+  b.onclick = () => setLang(LANG === 'ar' ? 'en' : 'ar');
 });
