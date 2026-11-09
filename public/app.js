@@ -148,7 +148,11 @@ $('#use-password').addEventListener('change', (e) => {
 async function api(url, body, signal) {
   const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(errorText(data, 'uploadFailed'));
+  if (!r.ok) {
+    const err = new Error(errorText(data, 'uploadFailed'));
+    err.status = r.status;
+    throw err;
+  }
   return data;
 }
 
@@ -203,62 +207,130 @@ $('#form').addEventListener('submit', async (e) => {
     $('#error').textContent = t('offline');
     return;
   }
-
-  const controller = new AbortController();
-  state.upload = controller;
-  const wakeLock = await keepAwake();
   $('#submit').disabled = true;
   $('#error').textContent = '';
-  $('#progress').classList.add('show');
-  setProgress(0, t('preparing'));
-
   try {
     const slot = await api('/api/uploads', {
       files: files.map((f) => ({ name: f.name, size: f.size, type: f.type })),
       expiry: state.expiry, maxDownloads: state.downloads, password,
-    }, controller.signal);
+    });
+    const session = {
+      id: slot.id,
+      deleteToken: slot.deleteToken,
+      files: files.map((f, i) => ({
+        idx: slot.items[i].idx, pathname: slot.items[i].pathname,
+        name: f.name, size: f.size, type: f.type, lastModified: f.lastModified, done: false,
+      })),
+    };
+    uploadSession.save(session);
+    await sendFiles(session, files);
+  } catch (err) {
+    $('#error').textContent = err.message || t('uploadFailed');
+    $('#submit').disabled = false;
+  }
+});
 
-    // One file after another, with one progress bar for all of them.
-    const total = totalBytes();
-    const samples = [];
-    let done = 0;
-    for (const [i, f] of files.entries()) {
-      const step = files.length > 1 ? `${t('fileOfFiles', { i: i + 1, n: files.length })} · ` : '';
-      await window.blobUpload(slot.items[i].pathname, f, {
-        access: 'private',
-        handleUploadUrl: '/api/blob-upload',
-        clientPayload: slot.id,
-        contentType: f.type || undefined,
-        // Bigger files go up in parts; a part that fails on a weak connection is
-        // sent again on its own instead of restarting the whole file.
-        multipart: f.size > 8 * 1024 * 1024,
-        abortSignal: controller.signal,
-        onUploadProgress: (p) => {
-          const sent = done + p.loaded;
-          const detail = navigator.onLine ? (transferText(sent, total, samples) || t('uploading')) : t('waitingNet');
-          setProgress((sent / total) * 100, step + detail);
-        },
-      });
-      done += f.size;
-    }
+// Sends the files of a saved upload session and shows the link when done.
+// A dropped connection keeps the session, so the upload can be continued later.
+async function sendFiles(session, files) {
+  const controller = new AbortController();
+  state.upload = controller;
+  const wakeLock = await keepAwake();
+  $('#resume').hidden = true;
+  $('#submit').disabled = true;
+  $('#error').textContent = '';
+  $('#progress').classList.add('show');
+  setProgress(0, t('uploading'));
+  const samples = [];
+  try {
+    await runUpload(session, files, {
+      signal: controller.signal,
+      onWait: () => { $('#progress-label').textContent = t('waitingNet'); },
+      onProgress: (sent, total, i) => {
+        const step = files.length > 1 ? `${t('fileOfFiles', { i: i + 1, n: files.length })} · ` : '';
+        const detail = navigator.onLine ? (transferText(sent, total, samples) || t('uploading')) : t('waitingNet');
+        setProgress((sent / total) * 100, step + detail);
+      },
+    });
 
     setProgress(100, t('finishing'));
-    const data = await api(`/api/uploads/${slot.id}/complete`, { deleteToken: slot.deleteToken }, controller.signal);
+    const data = await api(`/api/uploads/${session.id}/complete`, { deleteToken: session.deleteToken }, controller.signal);
+    uploadSession.clear();
     data.name = linkLabel(data.files);
     store.set([{ id: data.id, name: data.name, size: data.size, url: data.url, deleteToken: data.deleteToken, expiresAt: data.expiresAt }, ...store.get()]);
     $('#password').value = '';
     showResult(data);
     renderRecent();
   } catch (err) {
-    $('#error').textContent = controller.signal.aborted ? t('uploadCancelled') : (err.message || t('uploadFailed'));
-    $('#submit').disabled = false;
+    if (controller.signal.aborted) {
+      // Cancelled on purpose: drop the unfinished upload.
+      discardSession(session);
+      $('#error').textContent = t('uploadCancelled');
+    } else {
+      $('#error').textContent = err.message || t('uploadFailed');
+      offerResume(session); // whatever arrived is kept
+    }
+    $('#submit').disabled = !state.files.length;
   } finally {
     state.upload = null;
     if (wakeLock) wakeLock.release().catch(() => {});
     $('#progress').classList.remove('show');
     setProgress(0);
   }
-});
+}
+
+function discardSession(session) {
+  uploadSession.clear();
+  fetch(`/api/files/${session.id}`, { method: 'DELETE', headers: { 'X-Delete-Token': session.deleteToken } }).catch(() => {});
+}
+
+// ---------- Continue an unfinished upload ----------
+function offerResume(session) {
+  const total = session.files.reduce((sum, f) => sum + f.size, 0);
+  const pct = Math.floor((sessionSentBytes(session) / total) * 100);
+  $('#resume-text').textContent = t('resumeText', {
+    files: countText(session.files.length, 'oneFile', 'nFiles', 'nFilesMany'), pct,
+  });
+  $('#resume-names').textContent = session.files.map((f) => f.name).join(' · ');
+  $('#resume').hidden = false;
+  $('#resume-go').onclick = () => $('#resume-file').click();
+  $('#resume-drop').onclick = () => {
+    discardSession(session);
+    $('#resume').hidden = true;
+  };
+  $('#resume-file').onchange = () => {
+    const picked = [...$('#resume-file').files];
+    $('#resume-file').value = '';
+    // The same files: matched by name and size (and date, where the phone keeps it).
+    const files = session.files.map((sf) => picked.find((f) => f.name === sf.name && f.size === sf.size
+      && (!sf.lastModified || !f.lastModified || f.lastModified === sf.lastModified)));
+    const missing = session.files.filter((sf, i) => !files[i] && !sf.done);
+    if (missing.length) {
+      toast(t('resumeMissing', { names: missing.map((f) => f.name).join('، ') }));
+      return;
+    }
+    sendFiles(session, files);
+  };
+}
+
+// On page load: is there an upload that stopped half way?
+(async () => {
+  const session = uploadSession.load();
+  if (!session) return;
+  try {
+    const st = await api(`/api/uploads/${session.id}/status`, { deleteToken: session.deleteToken });
+    if (st.status !== 'pending') return uploadSession.clear();
+    for (const it of st.items) {
+      const sf = session.files.find((f) => f.idx === it.idx);
+      if (sf && it.uploaded) sf.done = true;
+    }
+    uploadSession.save(session);
+    offerResume(session);
+  } catch (err) {
+    // Gone from the server (too old, or deleted): nothing to continue.
+    if (err.status === 404) uploadSession.clear();
+  }
+})();
 
 // ---------- Result ----------
 function showResult(data) {

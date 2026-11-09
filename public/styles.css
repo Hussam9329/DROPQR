@@ -333,3 +333,10 @@ footer .legal { margin-top: 6px; }
 /* File names always read left to right (extension last), also on Arabic pages. */
 .fname { unicode-bidi: isolate; }
 [dir="rtl"] .fname { text-align: right; }
+
+/* ---------- Continue an unfinished upload ---------- */
+.resume { margin-bottom: 20px; padding: 16px; border-radius: 14px; border: 1px solid var(--accent); background: var(--accent-soft); }
+.resume-text { margin: 0 0 6px; font-weight: 600; line-height: 1.6; }
+.resume-names { margin: 0 0 12px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.resume .row-actions { margin-top: 0; }
+.resume .btn-primary { width: auto; margin-top: 0; }

@@ -13,7 +13,7 @@ Live: https://dropqr-mu.vercel.app
 ## How it works
 
 1. `POST /api/uploads` reserves an id and a storage path for each file (up to 20 files per link, `MAX_FILE_MB` in total; table `items`).
-2. The browser uploads directly to Blob (`/api/blob-upload` hands out a one-time token for that exact path only).
+2. The browser uploads each file directly to Blob (`public/uploader.js`), with a token from `POST /api/uploads/:id/token` limited to that exact path and size. Files over 8 MB go in 8 MB parts; every finished part is saved in the browser, so after a reload or a dropped connection the upload continues from the next part (`POST /api/uploads/:id/status` reports which files already arrived). Unfinished uploads are kept 24 hours.
 3. `POST /api/uploads/:id/complete` checks the file arrived, starts its timer and returns the link + QR code.
 4. `POST /api/files/:id/download` (sent by a Download button) uses up one download (atomic SQL update) and returns 15-minute signed storage links for every file in the link, so the file downloads straight from storage and can resume.
    Opening the share page `/f/:id` (built by the server, with link-preview tags) does **not** use a download.

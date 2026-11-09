@@ -153,6 +153,12 @@ const STRINGS = {
     err_report_reason: 'Please choose a reason.',
     err_upload_failed: 'Upload failed. Please try again.',
     err_too_many_files: 'You can share up to {max} files at once.',
+    err_upload_not_found: 'This upload no longer exists. Please start again.',
+    err_upload_done: 'This upload has already finished.',
+    resumeText: 'An upload stopped before it finished ({files}, {pct}% already sent). Choose the same files to continue from where it stopped.',
+    resumeGo: 'Choose the files and continue',
+    resumeDrop: 'Discard',
+    resumeMissing: 'Please also choose: {names}',
   },
   ar: {
     switchLang: 'English',
@@ -304,6 +310,12 @@ const STRINGS = {
     err_report_reason: 'اختر سبباً من فضلك.',
     err_upload_failed: 'فشل الرفع. حاول مرة أخرى.',
     err_too_many_files: 'يمكنك مشاركة {max} ملفاً كحد أقصى في المرة الواحدة.',
+    err_upload_not_found: 'هذا الرفع لم يعد موجوداً. ابدأ من جديد.',
+    err_upload_done: 'هذا الرفع انتهى مسبقاً.',
+    resumeText: 'توقف رفع قبل أن يكتمل ({files}، أُرسل {pct}% منه). اختر نفس الملفات لتكمل من حيث توقف.',
+    resumeGo: 'اختر الملفات وأكمل',
+    resumeDrop: 'تجاهل',
+    resumeMissing: 'اختر أيضاً: {names}',
   },
 };
 

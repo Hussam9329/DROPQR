@@ -43,6 +43,17 @@
     </section>
 
     <section class="card uploader">
+      <!-- An upload that stopped half way (reload, power cut, lost connection) -->
+      <div class="resume" id="resume" hidden>
+        <p class="resume-text" id="resume-text"></p>
+        <p class="resume-names fname" id="resume-names" dir="ltr"></p>
+        <div class="row-actions">
+          <button class="btn btn-primary" id="resume-go" type="button" data-i18n="resumeGo"></button>
+          <button class="btn btn-ghost" id="resume-drop" type="button" data-i18n="resumeDrop"></button>
+        </div>
+        <input type="file" id="resume-file" multiple hidden>
+      </div>
+
       <!-- Upload form -->
       <form id="form" novalidate>
         <label class="dropzone" id="dropzone">
@@ -179,6 +190,7 @@
   <script src="/vendor/blob-upload.js"></script>
   <script src="/i18n.js"></script>
   <script src="/common.js"></script>
+  <script src="/uploader.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

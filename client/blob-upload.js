@@ -1,4 +1,5 @@
 // Bundled into public/vendor/blob-upload.js by `npm run bundle`.
-import { upload } from '@vercel/blob/client';
+// The upload page sends files straight to Blob storage, in one go or in parts.
+import { put, createMultipartUpload, uploadPart, completeMultipartUpload } from '@vercel/blob/client';
 
-window.blobUpload = upload;
+window.blobClient = { put, createMultipartUpload, uploadPart, completeMultipartUpload };

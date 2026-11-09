@@ -9,6 +9,8 @@ const path = require('node:path');
 const { PGlite } = require('@electric-sql/pglite');
 
 process.env.CRON_SECRET = 'test-secret';
+// A made-up store token: upload tokens are signed locally, no network needed.
+process.env.BLOB_READ_WRITE_TOKEN = 'vercel_blob_rw_teststore123_abcdefghijklmnopqrstuvwxyz';
 process.env.STORAGE_CAP_GB = String(3 / 1024); // 3 MB for the whole site
 process.env.DAILY_UPLOAD_MB = '1'; // 1 MB per visitor per day
 process.env.ADMIN_SECRET = 'admin-pass';
@@ -419,4 +421,48 @@ test('links made before multi-file sharing still work', async () => {
   assert.ok(d.url.includes('f/oldlink1/old.pdf'));
   assert.equal((await json('DELETE', '/api/files/oldlink1', null, { 'x-delete-token': 'tok' })).status, 200);
   assert.equal(blobs.has('f/oldlink1/old.pdf'), false);
+});
+
+// ---------- Stage 5: resumable uploads ----------
+test('upload tokens are per file and only for the uploader', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const slot = await (await json('POST', '/api/uploads', { files: [{ name: 'clip.mp4', size: 4000 }, { name: 'small.txt', size: 9 }], expiry: '1h', maxDownloads: 1 })).json();
+  assert.equal((await json('POST', `/api/uploads/${slot.id}/token`, { deleteToken: 'wrong', idx: 0 })).status, 404);
+  assert.equal((await json('POST', `/api/uploads/${slot.id}/token`, { deleteToken: slot.deleteToken, idx: 7 })).status, 404);
+  const tkRes = await json('POST', `/api/uploads/${slot.id}/token`, { deleteToken: slot.deleteToken, idx: 1 });
+  const tk = await tkRes.json();
+  assert.equal(tkRes.status, 200, JSON.stringify(tk));
+  assert.match(tk.token, /^vercel_blob_client_teststore123_/);
+  assert.equal(tk.pathname, slot.items[1].pathname);
+  // The token is limited to that one file and its size.
+  const payload = JSON.parse(Buffer.from(Buffer.from(tk.token.split('_').pop(), 'base64').toString().split('.')[1], 'base64').toString());
+  assert.equal(payload.pathname, slot.items[1].pathname);
+  assert.equal(payload.maximumSizeInBytes, 9);
+});
+
+test('upload status says which files arrived, for resuming', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const slot = await (await json('POST', '/api/uploads', { files: [{ name: 'a', size: 5 }, { name: 'b', size: 6 }], expiry: '1h', maxDownloads: 1 })).json();
+  const st = (body) => json('POST', `/api/uploads/${slot.id}/status`, body).then((r) => r.json());
+  assert.deepEqual((await st({ deleteToken: slot.deleteToken })).items.map((i) => i.uploaded), [false, false]);
+  blobs.set(slot.items[0].pathname, { size: 5 });
+  const mid = await st({ deleteToken: slot.deleteToken });
+  assert.equal(mid.status, 'pending');
+  assert.deepEqual(mid.items.map((i) => i.uploaded), [true, false]);
+  assert.equal((await json('POST', `/api/uploads/${slot.id}/status`, { deleteToken: 'x' })).status, 404);
+  blobs.set(slot.items[1].pathname, { size: 6 });
+  await json('POST', `/api/uploads/${slot.id}/complete`, { deleteToken: slot.deleteToken });
+  assert.equal((await st({ deleteToken: slot.deleteToken })).status, 'ready');
+  assert.equal((await json('POST', `/api/uploads/${slot.id}/token`, { deleteToken: slot.deleteToken, idx: 0 })).status, 409);
+});
+
+test('an unfinished upload can be resumed for 24 hours, then it is dropped', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const fresh = await (await json('POST', '/api/uploads', { files: [{ name: 'a', size: 5 }], expiry: '1h', maxDownloads: 1 })).json();
+  const old = await (await json('POST', '/api/uploads', { files: [{ name: 'b', size: 5 }], expiry: '1h', maxDownloads: 1 })).json();
+  await pg.query("UPDATE files SET created_at = now() - interval '5 hours' WHERE id = $1", [fresh.id]);
+  await pg.query("UPDATE files SET created_at = now() - interval '25 hours' WHERE id = $1", [old.id]);
+  await json('GET', '/api/cron/cleanup', null, { authorization: 'Bearer test-secret' });
+  const left = (await pg.query('SELECT id FROM files WHERE id = ANY($1)', [[fresh.id, old.id]])).rows.map((r) => r.id);
+  assert.deepEqual(left, [fresh.id]);
 });

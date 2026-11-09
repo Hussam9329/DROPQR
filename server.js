@@ -4,7 +4,7 @@ const express = require('express');
 const QRCode = require('qrcode');
 const { neon } = require('@neondatabase/serverless');
 const { head, del, issueSignedToken, presignUrl } = require('@vercel/blob');
-const { handleUpload } = require('@vercel/blob/client');
+const { generateClientTokenFromReadWriteToken } = require('@vercel/blob/client');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const { promisify } = require('node:util');
@@ -28,7 +28,11 @@ const DOWNLOAD_LINK_MS = 15 * 60 * 1000;
 // A file stays in storage this long after it stops being downloadable,
 // so a download that already started can finish.
 const GRACE_MS = DOWNLOAD_LINK_MS + 5 * 60 * 1000;
-const PENDING_TTL_MS = 2 * 60 * 60 * 1000; // uploads never finished are dropped after this
+// An unfinished upload can be resumed this long (after a reload or a power cut);
+// after that it is dropped.
+const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+// How long one upload token works. A new one is fetched when it runs out.
+const UPLOAD_TOKEN_MS = 60 * 60 * 1000;
 
 // Allowed lifetimes (key -> seconds). The client may only pick from these.
 const EXPIRY_OPTIONS = {
@@ -317,7 +321,7 @@ app.use('/api', async (_req, _res, next) => {
 });
 
 const uploadLimiter = limit('upload', 15 * 60, 30);
-const blobTokenLimiter = limit('blob', 15 * 60, 60);
+const tokenLimiter = limit('blob', 15 * 60, 120);
 const completeLimiter = limit('complete', 15 * 60, 30);
 const downloadLimiter = limit('download', 15 * 60, 60);
 const apiLimiter = limit('api', 60, 120);
@@ -409,31 +413,45 @@ app.post('/api/uploads', uploadLimiter, h(async (req, res) => {
   });
 }));
 
-// Step 2: the browser asks for a one-time token and uploads straight to Blob storage.
-app.post('/api/blob-upload', blobTokenLimiter, h(async (req, res) => {
-  try {
-    const result = await handleUpload({
-      body: req.body,
-      request: req,
-      onBeforeGenerateToken: async (pathname, clientPayload) => {
-        const [item] = await query(`SELECT items.size FROM items JOIN files ON files.id = items.file_id
-          WHERE items.file_id = $1 AND items.pathname = $2 AND files.status = 'pending'`, [clientPayload, pathname]);
-        if (!item) throw new Error('Upload not allowed.');
-        return {
-          maximumSizeInBytes: Number(item.size),
-          addRandomSuffix: false,
-          allowOverwrite: false,
-          validUntil: Date.now() + 60 * 60 * 1000,
-        };
-      },
-      // Finalising happens in /complete, so nothing is needed here.
-      onUploadCompleted: async () => {},
-    });
-    res.json(result);
-  } catch (err) {
-    console.error('blob upload token refused', err);
-    fail(res, 400, 'upload_failed', 'Upload failed. Please try again.');
+// An upload that is still in progress, for the browser that started it
+// (it proves this with the delete token it was given).
+async function pendingUpload(req, res) {
+  const [row] = await query('SELECT * FROM files WHERE id = $1', [req.params.id]);
+  if (!row || !sameSecret(String(req.body?.deleteToken || ''), row.delete_token)) {
+    fail(res, 404, 'upload_not_found', 'Upload not found.');
+    return null;
   }
+  return row;
+}
+
+// Step 2: a token that lets the browser upload one file straight to storage,
+// in one go or in parts. Asked again after a reload or when it runs out.
+app.post('/api/uploads/:id/token', tokenLimiter, h(async (req, res) => {
+  const row = await pendingUpload(req, res);
+  if (!row) return;
+  if (row.status !== 'pending') return fail(res, 409, 'upload_done', 'Upload already finished.');
+  const item = (await itemsOf(row)).find((it) => it.idx === Number(req.body?.idx));
+  if (!item) return fail(res, 404, 'upload_not_found', 'Upload not found.');
+  const token = await generateClientTokenFromReadWriteToken({
+    pathname: item.pathname,
+    maximumSizeInBytes: Number(item.size),
+    addRandomSuffix: false,
+    allowOverwrite: false,
+    validUntil: Date.now() + UPLOAD_TOKEN_MS,
+  });
+  res.json({ token, pathname: item.pathname });
+}));
+
+// Which files of an unfinished upload already reached storage, so a resumed
+// upload skips them.
+app.post('/api/uploads/:id/status', tokenLimiter, h(async (req, res) => {
+  const row = await pendingUpload(req, res);
+  if (!row) return;
+  const items = await itemsOf(row);
+  const done = row.status === 'pending'
+    ? await Promise.all(items.map((it) => head(it.pathname).then(() => true, () => false)))
+    : items.map(() => true);
+  res.json({ status: row.status, items: items.map((it, i) => ({ idx: it.idx, uploaded: done[i] })) });
 }));
 
 // Step 3: confirm the file landed, start its timer, and return the link + QR code.
