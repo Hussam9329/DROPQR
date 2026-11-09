@@ -15,6 +15,8 @@
   <meta name="twitter:card" content="summary_large_image">
   <link rel="icon" href="/logo.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#0a0d17">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
@@ -28,6 +30,7 @@
     <nav class="nav-links">
       <a href="#how" data-i18n="navHow"></a>
       <a href="#recent" data-i18n="navLinks"></a>
+      <button class="btn btn-ghost install-btn" id="install" type="button" hidden data-i18n="installApp"></button>
       <button class="btn btn-ghost lang-toggle" type="button"></button>
     </nav>
   </header>
@@ -190,6 +193,7 @@
   <script src="/vendor/blob-upload.js"></script>
   <script src="/i18n.js"></script>
   <script src="/common.js"></script>
+  <script src="/share-store.js"></script>
   <script src="/uploader.js"></script>
   <script src="/app.js"></script>
 </body>

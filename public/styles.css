@@ -340,3 +340,5 @@ footer .legal { margin-top: 6px; }
 .resume-names { margin: 0 0 12px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
 .resume .row-actions { margin-top: 0; }
 .resume .btn-primary { width: auto; margin-top: 0; }
+
+.install-btn { padding: 7px 12px; font-size: 13px; }

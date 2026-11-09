@@ -486,3 +486,34 @@ async function renderRecent() {
   }
 }
 renderRecent();
+
+// ---------- Install as an app, and "Share to DropQR" from the phone ----------
+// The service worker receives files shared from the phone's Share menu.
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+
+// An "Install app" button where the browser allows it (Android Chrome, desktop
+// Chrome/Edge). Once installed, DropQR appears in the phone's Share menu.
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installPrompt = e;
+  $('#install').hidden = false;
+});
+$('#install').onclick = async () => {
+  if (!installPrompt) return;
+  installPrompt.prompt();
+  await installPrompt.userChoice.catch(() => {});
+  installPrompt = null;
+  $('#install').hidden = true;
+};
+window.addEventListener('appinstalled', () => { $('#install').hidden = true; });
+
+// Opened from the Share menu: pick up the shared files.
+if (new URLSearchParams(location.search).has('shared')) {
+  history.replaceState(null, '', '/');
+  Promise.all([takeSharedFiles(), configReady]).then(([files]) => {
+    if (!files.length) return;
+    addFiles(files);
+    toast(t('sharedReady'));
+  }).catch(() => {});
+}

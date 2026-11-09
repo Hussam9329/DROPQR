@@ -466,3 +466,10 @@ test('an unfinished upload can be resumed for 24 hours, then it is dropped', asy
   const left = (await pg.query('SELECT id FROM files WHERE id = ANY($1)', [[fresh.id, old.id]])).rows.map((r) => r.id);
   assert.deepEqual(left, [fresh.id]);
 });
+
+// ---------- Stage 6: share from the phone ----------
+test('a share without the service worker still lands on the upload page', async () => {
+  const r = await fetch(bases[0] + '/share-target', { method: 'POST', body: new FormData(), redirect: 'manual' });
+  assert.equal(r.status, 303);
+  assert.equal(r.headers.get('location'), '/?shared=1');
+});

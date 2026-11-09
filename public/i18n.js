@@ -158,6 +158,8 @@ const STRINGS = {
     resumeText: 'An upload stopped before it finished ({files}, {pct}% already sent). Choose the same files to continue from where it stopped.',
     resumeGo: 'Choose the files and continue',
     resumeDrop: 'Discard',
+    installApp: 'Install app',
+    sharedReady: 'Your shared files are ready. Choose how long they stay, then tap Upload.',
     resumeMissing: 'Please also choose: {names}',
   },
   ar: {
@@ -315,6 +317,8 @@ const STRINGS = {
     resumeText: 'توقف رفع قبل أن يكتمل ({files}، أُرسل {pct}% منه). اختر نفس الملفات لتكمل من حيث توقف.',
     resumeGo: 'اختر الملفات وأكمل',
     resumeDrop: 'تجاهل',
+    installApp: 'ثبّت التطبيق',
+    sharedReady: 'ملفاتك المشاركة جاهزة. اختر مدة بقائها ثم اضغط رفع.',
     resumeMissing: 'اختر أيضاً: {names}',
   },
 };

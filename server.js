@@ -621,6 +621,10 @@ app.post('/api/admin/files/:id/link', h(async (req, res) => {
   res.json({ url: urls[0].url, urls });
 }));
 
+// Phone "Share to DropQR": the service worker normally answers this itself.
+// Without it (e.g. the very first open) the visitor still lands on the upload page.
+app.post('/share-target', (_req, res) => res.redirect(303, '/?shared=1'));
+
 // Old-style direct links open the download page instead of using up a download.
 app.get('/d/:id', (req, res) => res.redirect(303, `/f/${encodeURIComponent(req.params.id)}`));
 
