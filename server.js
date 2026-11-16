@@ -60,7 +60,8 @@ const REPORT_REASONS = {
 };
 const ABUSE_EMAIL = process.env.ABUSE_EMAIL || '';
 
-// HTML links: one HTML file becomes a page with a permanent link at /p/<uuid>.
+// HTML links: one HTML file becomes a page with a link at /p/<uuid> that stops
+// working after the chosen time (same choices as shared files).
 const HTML_MAX_BYTES = 10 * 1024 * 1024;
 
 // ---------- Database (Neon) ----------
@@ -126,6 +127,9 @@ function ensureSchema() {
       status      TEXT NOT NULL DEFAULT 'pending',
       created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
+    // Pages made before expiry existed have none and never expire.
+    await query('ALTER TABLE pages ADD COLUMN IF NOT EXISTS expiry_seconds INTEGER');
+    await query('ALTER TABLE pages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ');
   })().catch((err) => { schemaReady = null; throw err; });
   return schemaReady;
 }
@@ -306,7 +310,9 @@ async function cleanup() {
   lastCleanup = Date.now();
   await query("DELETE FROM usage_counters WHERE window_start <= now() - interval '1 day'");
   const pages = await query(`SELECT id, pathname FROM pages
-    WHERE status = 'pending' AND created_at <= now() - make_interval(secs => $1) LIMIT 500`, [PENDING_TTL_MS / 1000]);
+    WHERE (status = 'pending' AND created_at <= now() - make_interval(secs => $1))
+       OR (status = 'ready' AND expires_at <= now())
+    LIMIT 500`, [PENDING_TTL_MS / 1000]);
   if (pages.length) {
     await del(pages.map((r) => r.pathname));
     await query('DELETE FROM pages WHERE id = ANY($1)', [pages.map((r) => r.id)]);
@@ -651,19 +657,21 @@ app.post('/api/admin/files/:id/link', h(async (req, res) => {
 
 // ---------- HTML links ----------
 // Step 1: reserve a page and get a token to upload the file straight to storage.
-// Body: { name, size, uploadId }. The same uploadId always gives the same page,
+// Body: { name, size, uploadId, expiry }. The same uploadId always gives the same page,
 // so a retry after a dropped connection doesn't make a second one.
 app.post('/api/html', uploadLimiter, h(async (req, res) => {
   const uploadId = String(req.body?.uploadId || '');
   const name = safeFileName(req.body?.name);
   const size = Number(req.body?.size);
+  const seconds = EXPIRY_OPTIONS[req.body?.expiry];
+  if (!seconds) return fail(res, 400, 'invalid_options', 'Invalid expiry.');
   if (!/^[0-9a-f-]{36}$/.test(uploadId)) return fail(res, 400, 'bad_request', 'Invalid upload.');
   if (!/\.html?$/i.test(name)) return fail(res, 400, 'not_html', 'Choose an HTML file.');
   if (!Number.isSafeInteger(size) || size <= 0) return fail(res, 400, 'empty_file', 'Empty files cannot be shared.');
   if (size > HTML_MAX_BYTES) return fail(res, 400, 'too_large', 'The file is larger than 10 MB.', { mb: 10 });
 
   let [row] = await query('SELECT * FROM pages WHERE upload_id = $1', [uploadId]);
-  if (row?.status === 'ready') return res.json({ done: true, path: `/p/${row.id}`, name: row.name });
+  if (row?.status === 'ready') return res.json({ done: true, ...pageResult(row) });
   if (row && (row.name !== name || Number(row.size) !== size)) return fail(res, 409, 'bad_request', 'Invalid upload.');
   if (!row) {
     if (await storageUsed() + size > STORAGE_CAP_BYTES) {
@@ -675,8 +683,8 @@ app.post('/api/html', uploadLimiter, h(async (req, res) => {
       return fail(res, 429, 'daily_limit', "You reached today's upload limit. Please try again tomorrow.");
     }
     const id = crypto.randomUUID();
-    [row] = await query(`INSERT INTO pages (id, upload_id, pathname, name, size) VALUES ($1, $2, $3, $4, $5)
-      ON CONFLICT (upload_id) DO NOTHING RETURNING *`, [id, uploadId, `p/${id}/${name}`, name, size]);
+    [row] = await query(`INSERT INTO pages (id, upload_id, pathname, name, size, expiry_seconds) VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (upload_id) DO NOTHING RETURNING *`, [id, uploadId, `p/${id}/${name}`, name, size, seconds]);
     if (!row) [row] = await query('SELECT * FROM pages WHERE upload_id = $1', [uploadId]); // a parallel retry won
   }
   const token = await generateClientTokenFromReadWriteToken({
@@ -690,16 +698,24 @@ app.post('/api/html', uploadLimiter, h(async (req, res) => {
   res.json({ id: row.id, pathname: row.pathname, token });
 }));
 
-// Step 2: once the file is in storage, the page goes live. Answers with its path.
+// What the page shows once a link is made.
+function pageResult(row) {
+  return { path: `/p/${row.id}`, name: row.name, expiresAt: row.expires_at ? new Date(row.expires_at).getTime() : null };
+}
+
+// Step 2: once the file is in storage, the page goes live and its timer starts.
 app.post('/api/html/:id/complete', completeLimiter, h(async (req, res) => {
   const [row] = await query('SELECT * FROM pages WHERE id = $1 AND upload_id = $2', [req.params.id, String(req.body?.uploadId || '')]);
   if (!row) return fail(res, 404, 'upload_not_found', 'Upload not found.');
+  let page = row;
   if (row.status !== 'ready') {
     const blob = await head(row.pathname).catch(() => null);
     if (!blob) return fail(res, 400, 'upload_incomplete', 'The file did not finish uploading. Please try again.');
-    await query("UPDATE pages SET status = 'ready', size = $2 WHERE id = $1", [row.id, blob.size]);
+    [page] = await query(`UPDATE pages SET status = 'ready', size = $2,
+        expires_at = now() + make_interval(secs => COALESCE(expiry_seconds, 0))
+      WHERE id = $1 RETURNING *`, [row.id, blob.size]);
   }
-  res.json({ path: `/p/${row.id}`, name: row.name });
+  res.json(pageResult(page));
 }));
 
 // The page itself. It runs in a sandbox (its own blank origin), so its scripts
@@ -709,12 +725,18 @@ app.get('/p/:id', h(async (req, res) => {
   const [row] = /^[0-9a-f-]{36}$/.test(req.params.id)
     ? await query("SELECT * FROM pages WHERE id = $1 AND status = 'ready'", [req.params.id])
     : [];
+  const left = row?.expires_at ? new Date(row.expires_at).getTime() - Date.now() : Infinity;
+  if (row && left <= 0) {
+    cleanupSoon();
+    return res.status(410).set('Cache-Control', 'no-store').type('html').send(EXPIRED_PAGE);
+  }
   const blob = row && await get(row.pathname, { access: 'private' });
   if (!blob) return res.status(404).type('html').send(NOT_FOUND_PAGE);
   res.set({
     'Content-Type': 'text/html; charset=utf-8',
     'Content-Security-Policy': 'sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads',
-    'Cache-Control': 'public, max-age=300',
+    // Never cached past the moment the link expires.
+    'Cache-Control': `private, max-age=${Math.max(0, Math.min(300, Math.floor(left / 1000)))}`,
   });
   res.removeHeader('X-Frame-Options');
   pipeline(Readable.fromWeb(blob.stream), res, (err) => { if (err) console.error('page stream failed', err); });
@@ -762,6 +784,10 @@ const NOT_FOUND_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-
 <title>Not found — DropQR</title><link rel="stylesheet" href="/styles.css"></head><body><main>
 <section class="card dl" style="margin-top:80px"><h1>Page not found</h1><p class="sub">The page you are looking for does not exist.</p>
 <a class="btn btn-primary" href="/">Go home</a></section></main></body></html>`;
+const EXPIRED_PAGE = `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>انتهى الرابط — DropQR</title><link rel="stylesheet" href="/styles.css"></head><body><main>
+<section class="card dl" style="margin-top:80px"><h1>انتهت صلاحية هذا الرابط</h1><p class="sub">This link has expired.</p>
+<a class="btn btn-primary" href="/html.html">رابط HTML</a></section></main></body></html>`;
 app.use((_req, res) => res.status(404).type('html').send(NOT_FOUND_PAGE));
 
 app.use((err, _req, res, _next) => {

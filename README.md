@@ -22,8 +22,8 @@ Live: https://dropqr-mu.vercel.app
 
 ## HTML links (`/html.html`)
 
-Upload one HTML file (up to 10 MB) and get a permanent link to the page at `/p/<uuid>`.
-`POST /api/html` reserves the page and returns an upload token (the same `uploadId` always returns the same page, so retries are safe), the browser uploads the file straight to Blob, and `POST /api/html/:id/complete` makes it live.
+Upload one HTML file (up to 10 MB) and get a link to the page at `/p/<uuid>`. The uploader picks how long it lives, from the same choices as shared files (5 minutes to 7 days); after that `/p/<uuid>` answers 410 and the file is deleted by the next cleanup.
+`POST /api/html` (with `expiry`) reserves the page and returns an upload token (the same `uploadId` always returns the same page, so retries are safe), the browser uploads the file straight to Blob, and `POST /api/html/:id/complete` makes it live.
 `/p/:id` serves the page under `Content-Security-Policy: sandbox`, so its scripts run in their own blank origin and can't reach DropQR's API, cookies or storage. Pages count toward `STORAGE_CAP_GB` and `DAILY_UPLOAD_MB`.
 
 Expiry: 5m, 10m, 30m, 1h, 6h, 12h, 1d, 3d, 7d. Download limit: 1–100.
