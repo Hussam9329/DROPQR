@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#090d16"><title>رابط HTML</title><link rel="icon" href="/logo.svg" type="image/svg+xml"><style>
+:root{color-scheme:dark;--bg:#090d16;--panel:#131a28;--line:#263247;--text:#f5f7fc;--muted:#94a3b8;--blue:#4383ff}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:"Segoe UI",Tahoma,Arial,sans-serif}button,input,a{font:inherit}button,a,label{touch-action:manipulation}button{cursor:pointer}a{color:inherit;text-decoration:none}
+.shell{min-height:100vh;min-height:100svh;display:grid;place-items:center;padding:24px 16px;background:radial-gradient(ellipse at 50% 0%,#13233d 0,transparent 60%)}.card{width:min(100%,460px);min-width:0;background:linear-gradient(155deg,#172033,#111724);border:1px solid #273349;border-radius:26px;padding:30px;box-shadow:0 22px 70px #0005}.heading{display:flex;justify-content:center;align-items:center;gap:12px;margin-bottom:28px}.heading h1{font-size:26px;font-weight:750;margin:0;line-height:1.4}.brand-icon{display:grid;place-items:center;background:linear-gradient(140deg,#508dff,#3262db);height:47px;width:47px;border-radius:14px;box-shadow:0 8px 22px #2856c52e}
+.file-input{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip-path:inset(50%)}.drop-zone{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;min-height:237px;cursor:pointer;border:1.5px dashed #435470;border-radius:18px;background:#151f30;transition:background .18s,border-color .18s}.drop-zone:hover,.drop-zone.dragging{border-color:#70a4ff;background:#1d2c46}.drop-zone strong{font-size:18px;font-weight:650}.drop-hint{font-size:14px;color:var(--muted)}.upload-icon{height:60px;width:60px;border-radius:18px;background:#233657;color:#92b8ff;display:grid;place-items:center;margin-bottom:8px}.file-input:focus-visible+.drop-zone,button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #79a8ff;outline-offset:4px}
+.upload-state{min-height:237px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:18px;text-align:center}.upload-state strong{font-size:18px}.upload-name{font-size:14px;color:var(--muted);max-width:100%;overflow-wrap:anywhere}.spinner{width:38px;height:38px;border:3px solid #2b3b55;border-top-color:#6da4ff;border-radius:50%;animation:spin .8s linear infinite}.progress{width:100%;height:5px;background:#263248;border-radius:10px;overflow:hidden;direction:ltr}.progress span{display:block;height:100%;background:#5c95ff;border-radius:inherit;transition:width .25s}
+.result{animation:appear .2s ease}.ready{display:flex;align-items:center;justify-content:center;gap:10px;font-size:18px;margin:0 0 24px}.ready>span{display:grid;place-items:center;height:32px;width:32px;border-radius:50%;background:#143e35;color:#75dfb1}.file-row{display:flex;align-items:center;gap:10px;font-size:14px;color:#b7c5dc;margin-bottom:14px}.file-row svg{flex-shrink:0}.file-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.url-field{display:block;min-width:0;width:100%;border:1px solid #34435c;background:#0b1220;border-radius:12px;padding:14px 12px;color:#d3e0f7;font-family:ui-monospace,Consolas,monospace;font-size:14px;line-height:1.5;text-overflow:ellipsis;margin-bottom:14px}.actions{display:grid;grid-template-columns:1.35fr 1fr;gap:10px}.actions button,.actions a{min-height:50px;display:flex;align-items:center;justify-content:center;gap:9px;border-radius:12px;font-size:16px;font-weight:650;transition:background .15s,transform .15s}.actions button:active,.actions a:active{transform:scale(.98)}.primary{border:1px solid #508dff;background:#3878ef;color:white}.primary:hover{background:#4e89f5}.secondary{border:1px solid #35445e;background:#1d2a40}.secondary:hover{background:#2a3a55}.another{display:block;width:100%;border:0;background:transparent;color:#a8bbd9;font-size:14px;min-height:46px;margin-top:12px;border-radius:10px}.another:hover{color:#edf4ff;background:#ffffff06}
+.error{display:flex;align-items:flex-start;gap:10px;margin-top:16px;padding:12px;background:#49232b;border:1px solid #773540;border-radius:12px;font-size:14px;line-height:1.7;color:#ffced5}.error span{flex:1}.error button{display:grid;place-items:center;border:0;background:none;color:inherit;padding:3px}.retry{width:100%;min-height:44px;border:1px solid #3e5274;border-radius:12px;margin-top:10px;background:#203351;color:white;font-size:14px}
+@keyframes spin{to{transform:rotate(360deg)}}@keyframes appear{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}@media(max-width:400px){.card{padding:24px 20px;border-radius:22px}.heading h1{font-size:24px}.actions{grid-template-columns:1fr 1fr}.actions button,.actions a{font-size:15px;gap:7px}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+
+[hidden]{display:none!important}.link-symbol{font:700 27px monospace}.drop-zone{width:100%}.upload-icon{font-size:32px}.file-row{overflow-wrap:anywhere}.url-field{box-sizing:border-box}button{color:inherit}
+</style></head><body><main class="shell"><section class="card">
+<header class="heading"><span class="brand-icon link-symbol">↗</span><h1>رابط HTML</h1></header>
+<input id="file" class="file-input" type="file" accept=".html,.htm,text/html" aria-label="اختيار ملف HTML">
+<label id="drop" class="drop-zone" for="file"><span class="upload-icon">↑</span><strong>اختر ملف HTML</strong><span class="drop-hint">أو اسحبه هنا</span></label>
+<div id="busy" class="upload-state" role="status" hidden><span class="spinner"></span><strong>جاري رفع الملف…</strong><span id="uploadName" class="upload-name" dir="auto"></span><div id="progress" class="progress" role="progressbar" aria-label="تقدم الرفع" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="bar"></span></div></div>
+<div id="result" class="result" aria-live="polite" hidden><div class="ready"><span>✓</span><strong>رابطك جاهز</strong></div><div id="name" class="file-row" dir="auto"></div><input id="url" class="url-field" readonly dir="ltr" aria-label="رابط الملف"><div class="actions"><button id="copy" type="button" class="primary">نسخ الرابط</button><a id="open" class="secondary" target="_blank" rel="noopener noreferrer">فتح ↗</a></div><button id="another" class="another" type="button">رفع ملف آخر</button></div>
+<div id="error" class="error" role="alert" hidden></div><button id="retry" class="retry" type="button" hidden>إعادة المحاولة</button>
+</section></main><script src="/vendor/blob-upload.js"></script><script>
+(() => {
+  // Same flow as before, on DropQR: reserve the page, upload the file straight
+  // to storage (with progress), then confirm it. A retry reuses the same upload id.
+  const $=id=>document.getElementById(id), MAX=10*1024*1024, TIMEOUT=120000;
+  const MESSAGES={rate_limited:'طلبات كثيرة. انتظر قليلاً وأعد المحاولة.',daily_limit:'وصلت حد الرفع اليومي. حاول غداً.',service_full:'الخدمة ممتلئة الآن. حاول لاحقاً.',too_large:'حجم الملف أكبر من 10 ميغابايت.',empty_file:'الملف فارغ. اختر ملفاً آخر.',not_html:'اختر ملف HTML.'};
+  let pending=null, xhr=null, link='', timer;
+  function error(message){$('error').textContent=message;$('error').hidden=!message;$('retry').hidden=!message||!pending||!!xhr||!!link;}
+  function state(value){$('drop').hidden=value!=='select';$('busy').hidden=value!=='busy';$('result').hidden=value!=='result';$('file').disabled=value==='busy';}
+  function progress(p){$('bar').style.width=p+'%';$('progress').setAttribute('aria-valuenow',String(p));}
+  async function post(url,body,signal){
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal});
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok){const e=new Error(MESSAGES[data.code]||'تعذر رفع الملف. أعد المحاولة.');e.known=true;throw e;}
+    return data;
+  }
+  async function upload(file,retry=false){
+    if(!file||xhr)return;
+    if(!retry)pending=null;
+    error('');
+    if(!/\.html?$/i.test(file.name)){error('اختر ملف HTML.');$('file').value='';return;}
+    if(!file.size){error('الملف فارغ. اختر ملفاً آخر.');$('file').value='';return;}
+    if(file.size>MAX){error('حجم الملف أكبر من 10 ميغابايت.');$('file').value='';return;}
+    pending=retry&&pending?.file===file?pending:{file,id:crypto.randomUUID()};
+    link='';$('copy').textContent='نسخ الرابط';$('uploadName').textContent=file.name;progress(0);state('busy');
+    const active=new AbortController();xhr=active;
+    const timeout=setTimeout(()=>active.abort(),TIMEOUT);
+    function fail(message){xhr=null;$('file').value='';state('select');error(message);}
+    try{
+      let data=await post('/api/html',{name:file.name,size:file.size,uploadId:pending.id},active.signal);
+      if(!data.done){
+        try{
+          await blobClient.put(data.pathname,file,{access:'private',contentType:'text/html',token:data.token,abortSignal:active.signal,
+            onUploadProgress:p=>{if(p.total)progress(Math.min(99,Math.round(100*p.loaded/p.total)));}});
+        }catch(err){if(!/already exists/i.test(err.message))throw err;} // an earlier try already finished
+        data=await post('/api/html/'+data.id+'/complete',{uploadId:pending.id},active.signal);
+      }
+      if(!/^\/p\/[a-f0-9-]{36}$/.test(data.path||''))return fail('تعذر قراءة الرابط. أعد المحاولة.');
+      xhr=null;link=new URL(data.path,location.origin).href;$('url').value=link;$('open').href=link;$('name').textContent=data.name;$('file').value='';state('result');error('');
+    }catch(err){
+      if(active.signal.aborted)return fail('تأخر الرفع. أعد المحاولة.');
+      if(err.known)return fail(err.message);
+      fail(navigator.onLine?'تعذر رفع الملف. أعد المحاولة.':'انقطع الاتصال. أعد المحاولة.');
+    }finally{clearTimeout(timeout);}
+  }
+  $('file').onchange=()=>upload($('file').files[0]);
+  $('drop').ondragover=event=>{event.preventDefault();$('drop').classList.add('dragging');};
+  $('drop').ondragleave=()=>$('drop').classList.remove('dragging');
+  $('drop').ondrop=event=>{event.preventDefault();$('drop').classList.remove('dragging');if(event.dataTransfer.files.length!==1){error('اختر ملفاً واحداً في كل مرة.');return;}upload(event.dataTransfer.files[0]);};
+  for(const name of ['drop','dragover'])window.addEventListener(name,event=>{if(event.dataTransfer&&Array.from(event.dataTransfer.types).includes('Files'))event.preventDefault();});
+  $('url').onclick=()=>$('url').select();
+  $('copy').onclick=async()=>{
+    if(!link)return;let copied=false;
+    try{await navigator.clipboard.writeText(link);copied=true;}catch{$('url').focus();$('url').select();try{copied=document.execCommand('copy');}catch{}}
+    if(!copied){error('حدد الرابط وانسخه من الحقل.');return;}
+    error('');$('copy').textContent='تم النسخ ✓';clearTimeout(timer);timer=setTimeout(()=>$('copy').textContent='نسخ الرابط',2200);
+  };
+  $('another').onclick=()=>{pending=null;link='';$('file').value='';error('');state('select');};
+  $('retry').onclick=()=>upload(pending?.file,true);
+})();
+</script></body></html>

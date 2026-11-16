@@ -20,6 +20,12 @@ Live: https://dropqr-mu.vercel.app
    A protected file needs its password for `/unlock` and `/download`; wrong guesses are capped per visitor.
 5. Expired / used-up files are deleted from Blob and the database: alongside normal traffic (at most once a minute) and by a daily Vercel Cron job as a safety net.
 
+## HTML links (`/html.html`)
+
+Upload one HTML file (up to 10 MB) and get a permanent link to the page at `/p/<uuid>`.
+`POST /api/html` reserves the page and returns an upload token (the same `uploadId` always returns the same page, so retries are safe), the browser uploads the file straight to Blob, and `POST /api/html/:id/complete` makes it live.
+`/p/:id` serves the page under `Content-Security-Policy: sandbox`, so its scripts run in their own blank origin and can't reach DropQR's API, cookies or storage. Pages count toward `STORAGE_CAP_GB` and `DAILY_UPLOAD_MB`.
+
 Expiry: 5m, 10m, 30m, 1h, 6h, 12h, 1d, 3d, 7d. Download limit: 1–100.
 
 ## Run locally
