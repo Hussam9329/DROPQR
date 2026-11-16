@@ -9,23 +9,34 @@
 .error{display:flex;align-items:flex-start;gap:10px;margin-top:16px;padding:12px;background:#49232b;border:1px solid #773540;border-radius:12px;font-size:14px;line-height:1.7;color:#ffced5}.error span{flex:1}.error button{display:grid;place-items:center;border:0;background:none;color:inherit;padding:3px}.retry{width:100%;min-height:44px;border:1px solid #3e5274;border-radius:12px;margin-top:10px;background:#203351;color:white;font-size:14px}
 @keyframes spin{to{transform:rotate(360deg)}}@keyframes appear{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}@media(max-width:400px){.card{padding:24px 20px;border-radius:22px}.heading h1{font-size:24px}.actions{grid-template-columns:1fr 1fr}.actions button,.actions a{font-size:15px;gap:7px}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 
+.expiry{margin-bottom:16px}.expiry-label{font-size:14px;color:var(--muted);margin-bottom:9px}.chips{display:flex;flex-wrap:wrap;gap:7px}.chip{min-height:38px;padding:0 13px;border-radius:10px;border:1px solid #35445e;background:#1d2a40;color:#d3e0f7;font-size:14px;transition:background .15s,border-color .15s}.chip:hover{border-color:#70a4ff}.chip[aria-pressed="true"]{background:#3878ef;border-color:#508dff;color:#fff}.expires{font-size:14px;color:#b7c5dc;margin:-4px 0 14px}
 [hidden]{display:none!important}.link-symbol{font:700 27px monospace}.drop-zone{width:100%}.upload-icon{font-size:32px}.file-row{overflow-wrap:anywhere}.url-field{box-sizing:border-box}button{color:inherit}
 </style></head><body><main class="shell"><section class="card">
 <header class="heading"><span class="brand-icon link-symbol">↗</span><h1>رابط HTML</h1></header>
+<div id="expiryBox" class="expiry"><div class="expiry-label">يُحذف بعد</div><div id="expiry" class="chips" role="group" aria-label="يُحذف بعد"></div></div>
 <input id="file" class="file-input" type="file" accept=".html,.htm,text/html" aria-label="اختيار ملف HTML">
 <label id="drop" class="drop-zone" for="file"><span class="upload-icon">↑</span><strong>اختر ملف HTML</strong><span class="drop-hint">أو اسحبه هنا</span></label>
 <div id="busy" class="upload-state" role="status" hidden><span class="spinner"></span><strong>جاري رفع الملف…</strong><span id="uploadName" class="upload-name" dir="auto"></span><div id="progress" class="progress" role="progressbar" aria-label="تقدم الرفع" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="bar"></span></div></div>
-<div id="result" class="result" aria-live="polite" hidden><div class="ready"><span>✓</span><strong>رابطك جاهز</strong></div><div id="name" class="file-row" dir="auto"></div><input id="url" class="url-field" readonly dir="ltr" aria-label="رابط الملف"><div class="actions"><button id="copy" type="button" class="primary">نسخ الرابط</button><a id="open" class="secondary" target="_blank" rel="noopener noreferrer">فتح ↗</a></div><button id="another" class="another" type="button">رفع ملف آخر</button></div>
+<div id="result" class="result" aria-live="polite" hidden><div class="ready"><span>✓</span><strong>رابطك جاهز</strong></div><div id="name" class="file-row" dir="auto"></div><div id="expires" class="expires" hidden></div><input id="url" class="url-field" readonly dir="ltr" aria-label="رابط الملف"><div class="actions"><button id="copy" type="button" class="primary">نسخ الرابط</button><a id="open" class="secondary" target="_blank" rel="noopener noreferrer">فتح ↗</a></div><button id="another" class="another" type="button">رفع ملف آخر</button></div>
 <div id="error" class="error" role="alert" hidden></div><button id="retry" class="retry" type="button" hidden>إعادة المحاولة</button>
 </section></main><script src="/vendor/blob-upload.js"></script><script>
 (() => {
   // Same flow as before, on DropQR: reserve the page, upload the file straight
   // to storage (with progress), then confirm it. A retry reuses the same upload id.
   const $=id=>document.getElementById(id), MAX=10*1024*1024, TIMEOUT=120000;
-  const MESSAGES={rate_limited:'طلبات كثيرة. انتظر قليلاً وأعد المحاولة.',daily_limit:'وصلت حد الرفع اليومي. حاول غداً.',service_full:'الخدمة ممتلئة الآن. حاول لاحقاً.',too_large:'حجم الملف أكبر من 10 ميغابايت.',empty_file:'الملف فارغ. اختر ملفاً آخر.',not_html:'اختر ملف HTML.'};
-  let pending=null, xhr=null, link='', timer;
+  const MESSAGES={invalid_options:'اختر مدة صالحة.',rate_limited:'طلبات كثيرة. انتظر قليلاً وأعد المحاولة.',daily_limit:'وصلت حد الرفع اليومي. حاول غداً.',service_full:'الخدمة ممتلئة الآن. حاول لاحقاً.',too_large:'حجم الملف أكبر من 10 ميغابايت.',empty_file:'الملف فارغ. اختر ملفاً آخر.',not_html:'اختر ملف HTML.'};
+  const LABELS={'5m':'5 دقائق','10m':'10 دقائق','30m':'30 دقيقة','1h':'ساعة','6h':'6 ساعات','12h':'12 ساعة','1d':'يوم','3d':'3 أيام','7d':'7 أيام'}, PREF='dropqr:html-expiry';
+  let pending=null, xhr=null, link='', timer, expiry='1h';
+  try{const saved=localStorage.getItem(PREF);if(LABELS[saved])expiry=saved;}catch{}
+  function chips(options){
+    if(!options.includes(expiry))expiry=options.includes('1h')?'1h':options[0];
+    $('expiry').replaceChildren(...options.map(key=>{const b=document.createElement('button');b.type='button';b.className='chip';b.textContent=LABELS[key]||key;b.setAttribute('aria-pressed',String(key===expiry));
+      b.onclick=()=>{expiry=key;try{localStorage.setItem(PREF,key);}catch{}for(const c of $('expiry').children)c.setAttribute('aria-pressed',String(c===b));};return b;}));
+  }
+  chips(Object.keys(LABELS));
+  fetch('/api/config').then(r=>r.json()).then(c=>{if(Array.isArray(c.expiryOptions)&&c.expiryOptions.length)chips(c.expiryOptions);}).catch(()=>{});
   function error(message){$('error').textContent=message;$('error').hidden=!message;$('retry').hidden=!message||!pending||!!xhr||!!link;}
-  function state(value){$('drop').hidden=value!=='select';$('busy').hidden=value!=='busy';$('result').hidden=value!=='result';$('file').disabled=value==='busy';}
+  function state(value){$('drop').hidden=value!=='select';$('expiryBox').hidden=value!=='select';$('busy').hidden=value!=='busy';$('result').hidden=value!=='result';$('file').disabled=value==='busy';}
   function progress(p){$('bar').style.width=p+'%';$('progress').setAttribute('aria-valuenow',String(p));}
   async function post(url,body,signal){
     const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal});
@@ -40,13 +51,13 @@
     if(!/\.html?$/i.test(file.name)){error('اختر ملف HTML.');$('file').value='';return;}
     if(!file.size){error('الملف فارغ. اختر ملفاً آخر.');$('file').value='';return;}
     if(file.size>MAX){error('حجم الملف أكبر من 10 ميغابايت.');$('file').value='';return;}
-    pending=retry&&pending?.file===file?pending:{file,id:crypto.randomUUID()};
+    pending=retry&&pending?.file===file?pending:{file,id:crypto.randomUUID(),expiry};
     link='';$('copy').textContent='نسخ الرابط';$('uploadName').textContent=file.name;progress(0);state('busy');
     const active=new AbortController();xhr=active;
     const timeout=setTimeout(()=>active.abort(),TIMEOUT);
     function fail(message){xhr=null;$('file').value='';state('select');error(message);}
     try{
-      let data=await post('/api/html',{name:file.name,size:file.size,uploadId:pending.id},active.signal);
+      let data=await post('/api/html',{name:file.name,size:file.size,uploadId:pending.id,expiry:pending.expiry},active.signal);
       if(!data.done){
         try{
           await blobClient.put(data.pathname,file,{access:'private',contentType:'text/html',token:data.token,abortSignal:active.signal,
@@ -55,7 +66,7 @@
         data=await post('/api/html/'+data.id+'/complete',{uploadId:pending.id},active.signal);
       }
       if(!/^\/p\/[a-f0-9-]{36}$/.test(data.path||''))return fail('تعذر قراءة الرابط. أعد المحاولة.');
-      xhr=null;link=new URL(data.path,location.origin).href;$('url').value=link;$('open').href=link;$('name').textContent=data.name;$('file').value='';state('result');error('');
+      xhr=null;link=new URL(data.path,location.origin).href;$('url').value=link;$('open').href=link;$('name').textContent=data.name;$('expires').hidden=!data.expiresAt;if(data.expiresAt)$('expires').textContent='ينتهي: '+new Intl.DateTimeFormat('ar',{dateStyle:'medium',timeStyle:'short'}).format(new Date(data.expiresAt));$('file').value='';state('result');error('');
     }catch(err){
       if(active.signal.aborted)return fail('تأخر الرفع. أعد المحاولة.');
       if(err.known)return fail(err.message);

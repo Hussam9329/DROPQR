@@ -480,10 +480,10 @@ test('a share without the service worker still lands on the upload page', async 
 });
 
 // ---------- HTML links ----------
-async function htmlLink({ name = 'page.html', body = '<h1>مرحبا</h1>', uploadId = crypto.randomUUID(), ip = '10.0.0.9' } = {}) {
+async function htmlLink({ name = 'page.html', body = '<h1>مرحبا</h1>', uploadId = crypto.randomUUID(), ip = '10.0.0.9', expiry = '1d' } = {}) {
   const size = Buffer.byteLength(body);
   const headers = { 'x-real-ip': ip };
-  const r = await json('POST', '/api/html', { name, size, uploadId }, headers);
+  const r = await json('POST', '/api/html', { name, size, uploadId, expiry }, headers);
   const res = { status: r.status, body: await r.json(), uploadId };
   if (r.status !== 200 || res.body.done) return res;
   blobs.set(res.body.pathname, { size, contentType: 'text/html', body }); // the browser's direct upload
@@ -506,14 +506,14 @@ test('html link: upload gives /p/<uuid> and the page is served sandboxed', async
 
 test('html link: retrying with the same upload id gives the same page', async () => {
   const first = await htmlLink();
-  const again = await json('POST', '/api/html', { name: 'page.html', size: Buffer.byteLength('<h1>مرحبا</h1>'), uploadId: first.uploadId }, { 'x-real-ip': '10.0.0.9' });
+  const again = await json('POST', '/api/html', { name: 'page.html', size: Buffer.byteLength('<h1>مرحبا</h1>'), uploadId: first.uploadId, expiry: '1d' }, { 'x-real-ip': '10.0.0.9' });
   const body = await again.json();
   assert.equal(body.done, true);
   assert.equal(body.path, first.body.path);
 });
 
 test('html link: only non-empty HTML files up to 10 MB', async () => {
-  const send = (name, size) => json('POST', '/api/html', { name, size, uploadId: crypto.randomUUID() }, { 'x-real-ip': '10.0.0.9' });
+  const send = (name, size) => json('POST', '/api/html', { name, size, uploadId: crypto.randomUUID(), expiry: '1h' }, { 'x-real-ip': '10.0.0.9' });
   assert.equal((await (await send('a.txt', 10)).json()).code, 'not_html');
   assert.equal((await (await send('a.htm', 0)).json()).code, 'empty_file');
   assert.equal((await (await send('a.html', 10 * 1024 * 1024 + 1)).json()).code, 'too_large');
@@ -521,9 +521,43 @@ test('html link: only non-empty HTML files up to 10 MB', async () => {
 
 test('html link: unfinished upload, wrong upload id and unknown pages', async () => {
   const uploadId = crypto.randomUUID();
-  const r = await (await json('POST', '/api/html', { name: 'x.html', size: 5, uploadId }, { 'x-real-ip': '10.0.0.9' })).json();
+  const r = await (await json('POST', '/api/html', { name: 'x.html', size: 5, uploadId, expiry: '1h' }, { 'x-real-ip': '10.0.0.9' })).json();
   assert.equal((await json('POST', `/api/html/${r.id}/complete`, { uploadId }, { 'x-real-ip': '10.0.0.9' })).status, 400);
   assert.equal((await json('POST', `/api/html/${r.id}/complete`, { uploadId: crypto.randomUUID() }, { 'x-real-ip': '10.0.0.9' })).status, 404);
   assert.equal((await fetch(`${base()}/p/${r.id}`)).status, 404); // not live yet
   assert.equal((await fetch(`${base()}/p/not-a-page`)).status, 404);
+});
+
+test('html link: expiry is required and must be one of the file choices', async () => {
+  const send = (expiry) => json('POST', '/api/html', { name: 'a.html', size: 5, uploadId: crypto.randomUUID(), expiry }, { 'x-real-ip': '10.0.0.9' });
+  assert.equal((await (await send(undefined)).json()).code, 'invalid_options');
+  assert.equal((await (await send('2y')).json()).code, 'invalid_options');
+  assert.equal((await send('7d')).status, 200);
+});
+
+test('html link: the link stops working when its time is up, then the file is deleted', async () => {
+  const { body, id } = await htmlLink({ expiry: '3d' });
+  const days = (body.expiresAt - Date.now()) / 86400000;
+  assert.ok(days > 2.99 && days <= 3, `expires in ${days} days`);
+  const ok = await fetch(base() + body.path);
+  assert.equal(ok.status, 200);
+  assert.match(ok.headers.get('cache-control'), /max-age=300/);
+
+  const [{ pathname }] = (await pg.query('SELECT pathname FROM pages WHERE id = $1', [id])).rows;
+  await pg.query("UPDATE pages SET expires_at = now() - interval '1 second' WHERE id = $1", [id]);
+  const gone = await fetch(base() + body.path);
+  assert.equal(gone.status, 410);
+  assert.match(await gone.text(), /انتهت صلاحية/);
+
+  const r = await json('GET', '/api/cron/cleanup', null, { authorization: 'Bearer test-secret' });
+  assert.equal(r.status, 200);
+  assert.equal(blobs.has(pathname), false);
+  assert.equal((await pg.query('SELECT 1 FROM pages WHERE id = $1', [id])).rows.length, 0);
+  assert.equal((await fetch(base() + body.path)).status, 404);
+});
+
+test('html link: pages made before expiry existed keep working', async () => {
+  const { body, id } = await htmlLink();
+  await pg.query('UPDATE pages SET expiry_seconds = NULL, expires_at = NULL WHERE id = $1', [id]);
+  assert.equal((await fetch(base() + body.path)).status, 200);
 });
