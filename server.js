@@ -3,10 +3,11 @@
 const express = require('express');
 const QRCode = require('qrcode');
 const { neon } = require('@neondatabase/serverless');
-const { head, del, issueSignedToken, presignUrl } = require('@vercel/blob');
+const { head, del, get, issueSignedToken, presignUrl } = require('@vercel/blob');
 const { generateClientTokenFromReadWriteToken } = require('@vercel/blob/client');
 const crypto = require('node:crypto');
 const path = require('node:path');
+const { Readable, pipeline } = require('node:stream');
 const { promisify } = require('node:util');
 const downloadPage = require('./views/download-page');
 
@@ -59,6 +60,9 @@ const REPORT_REASONS = {
 };
 const ABUSE_EMAIL = process.env.ABUSE_EMAIL || '';
 
+// HTML links: one HTML file becomes a page with a permanent link at /p/<uuid>.
+const HTML_MAX_BYTES = 10 * 1024 * 1024;
+
 // ---------- Database (Neon) ----------
 const sql = neon(process.env.DATABASE_URL);
 const query = (text, params = []) => sql.query(text, params);
@@ -110,6 +114,17 @@ function ensureSchema() {
       key           TEXT PRIMARY KEY,
       window_start  TIMESTAMPTZ NOT NULL,
       amount        BIGINT NOT NULL
+    )`);
+    // HTML links: one HTML file per page. upload_id comes from the browser,
+    // so retrying the same upload gives back the same page.
+    await query(`CREATE TABLE IF NOT EXISTS pages (
+      id          TEXT PRIMARY KEY,
+      upload_id   TEXT NOT NULL UNIQUE,
+      pathname    TEXT NOT NULL UNIQUE,
+      name        TEXT NOT NULL,
+      size        BIGINT NOT NULL,
+      status      TEXT NOT NULL DEFAULT 'pending',
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
   })().catch((err) => { schemaReady = null; throw err; });
   return schemaReady;
@@ -243,6 +258,14 @@ async function addUsage(key, windowSec, amount) {
   return Number(row.amount);
 }
 
+// Bytes held in storage by shared files and HTML pages, unfinished uploads included.
+async function storageUsed() {
+  const [{ used }] = await query(`SELECT
+    (SELECT COALESCE(SUM(size), 0) FROM files WHERE status IN ('pending', 'ready'))
+    + (SELECT COALESCE(SUM(size), 0) FROM pages) AS used`);
+  return Number(used);
+}
+
 // Wraps async handlers so errors reach the error handler.
 const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -282,6 +305,12 @@ let lastCleanup = 0;
 async function cleanup() {
   lastCleanup = Date.now();
   await query("DELETE FROM usage_counters WHERE window_start <= now() - interval '1 day'");
+  const pages = await query(`SELECT id, pathname FROM pages
+    WHERE status = 'pending' AND created_at <= now() - make_interval(secs => $1) LIMIT 500`, [PENDING_TTL_MS / 1000]);
+  if (pages.length) {
+    await del(pages.map((r) => r.pathname));
+    await query('DELETE FROM pages WHERE id = ANY($1)', [pages.map((r) => r.id)]);
+  }
   const rows = await query(`SELECT id, pathname FROM files
     WHERE (status = 'ready' AND expires_at <= now() - make_interval(secs => $1))
        OR (status = 'ready' AND downloads >= max_downloads
@@ -375,8 +404,7 @@ app.post('/api/uploads', uploadLimiter, h(async (req, res) => {
   }
 
   // Unfinished reservations count too, so storage can't be filled by starting many uploads.
-  const [{ used }] = await query("SELECT COALESCE(SUM(size), 0) AS used FROM files WHERE status IN ('pending', 'ready')");
-  if (Number(used) + bytes > STORAGE_CAP_BYTES) {
+  if (await storageUsed() + bytes > STORAGE_CAP_BYTES) {
     return fail(res, 503, 'service_full', 'The service is full right now. Please try again later.');
   }
   const quotaKey = `bytes:${visitorKey(req)}`;
@@ -619,6 +647,77 @@ app.post('/api/admin/files/:id/link', h(async (req, res) => {
   if (!row) return res.status(404).json({ error: 'File not found.' });
   const urls = await signedDownloadUrls(await itemsOf(row));
   res.json({ url: urls[0].url, urls });
+}));
+
+// ---------- HTML links ----------
+// Step 1: reserve a page and get a token to upload the file straight to storage.
+// Body: { name, size, uploadId }. The same uploadId always gives the same page,
+// so a retry after a dropped connection doesn't make a second one.
+app.post('/api/html', uploadLimiter, h(async (req, res) => {
+  const uploadId = String(req.body?.uploadId || '');
+  const name = safeFileName(req.body?.name);
+  const size = Number(req.body?.size);
+  if (!/^[0-9a-f-]{36}$/.test(uploadId)) return fail(res, 400, 'bad_request', 'Invalid upload.');
+  if (!/\.html?$/i.test(name)) return fail(res, 400, 'not_html', 'Choose an HTML file.');
+  if (!Number.isSafeInteger(size) || size <= 0) return fail(res, 400, 'empty_file', 'Empty files cannot be shared.');
+  if (size > HTML_MAX_BYTES) return fail(res, 400, 'too_large', 'The file is larger than 10 MB.', { mb: 10 });
+
+  let [row] = await query('SELECT * FROM pages WHERE upload_id = $1', [uploadId]);
+  if (row?.status === 'ready') return res.json({ done: true, path: `/p/${row.id}`, name: row.name });
+  if (row && (row.name !== name || Number(row.size) !== size)) return fail(res, 409, 'bad_request', 'Invalid upload.');
+  if (!row) {
+    if (await storageUsed() + size > STORAGE_CAP_BYTES) {
+      return fail(res, 503, 'service_full', 'The service is full right now. Please try again later.');
+    }
+    const quotaKey = `bytes:${visitorKey(req)}`;
+    if (await addUsage(quotaKey, 24 * 60 * 60, size) > DAILY_UPLOAD_BYTES) {
+      await addUsage(quotaKey, 24 * 60 * 60, -size);
+      return fail(res, 429, 'daily_limit', "You reached today's upload limit. Please try again tomorrow.");
+    }
+    const id = crypto.randomUUID();
+    [row] = await query(`INSERT INTO pages (id, upload_id, pathname, name, size) VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (upload_id) DO NOTHING RETURNING *`, [id, uploadId, `p/${id}/${name}`, name, size]);
+    if (!row) [row] = await query('SELECT * FROM pages WHERE upload_id = $1', [uploadId]); // a parallel retry won
+  }
+  const token = await generateClientTokenFromReadWriteToken({
+    pathname: row.pathname,
+    maximumSizeInBytes: Number(row.size),
+    addRandomSuffix: false,
+    allowOverwrite: false,
+    validUntil: Date.now() + UPLOAD_TOKEN_MS,
+  });
+  cleanupSoon();
+  res.json({ id: row.id, pathname: row.pathname, token });
+}));
+
+// Step 2: once the file is in storage, the page goes live. Answers with its path.
+app.post('/api/html/:id/complete', completeLimiter, h(async (req, res) => {
+  const [row] = await query('SELECT * FROM pages WHERE id = $1 AND upload_id = $2', [req.params.id, String(req.body?.uploadId || '')]);
+  if (!row) return fail(res, 404, 'upload_not_found', 'Upload not found.');
+  if (row.status !== 'ready') {
+    const blob = await head(row.pathname).catch(() => null);
+    if (!blob) return fail(res, 400, 'upload_incomplete', 'The file did not finish uploading. Please try again.');
+    await query("UPDATE pages SET status = 'ready', size = $2 WHERE id = $1", [row.id, blob.size]);
+  }
+  res.json({ path: `/p/${row.id}`, name: row.name });
+}));
+
+// The page itself. It runs in a sandbox (its own blank origin), so its scripts
+// can't reach DropQR's API, cookies or browser storage.
+app.get('/p/:id', h(async (req, res) => {
+  await ensureSchema();
+  const [row] = /^[0-9a-f-]{36}$/.test(req.params.id)
+    ? await query("SELECT * FROM pages WHERE id = $1 AND status = 'ready'", [req.params.id])
+    : [];
+  const blob = row && await get(row.pathname, { access: 'private' });
+  if (!blob) return res.status(404).type('html').send(NOT_FOUND_PAGE);
+  res.set({
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Security-Policy': 'sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads',
+    'Cache-Control': 'public, max-age=300',
+  });
+  res.removeHeader('X-Frame-Options');
+  pipeline(Readable.fromWeb(blob.stream), res, (err) => { if (err) console.error('page stream failed', err); });
 }));
 
 // Phone "Share to DropQR": the service worker normally answers this itself.

@@ -6,6 +6,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { PGlite } = require('@electric-sql/pglite');
 
 process.env.CRON_SECRET = 'test-secret';
@@ -38,6 +39,10 @@ mock('@vercel/blob', {
   del: async (p) => {
     if (blobFailures.del) throw new Error('storage down');
     for (const x of [].concat(p)) blobs.delete(x);
+  },
+  get: async (p) => {
+    const b = blobs.get(p);
+    return b ? { statusCode: 200, stream: new Blob([b.body ?? '']).stream(), blob: b } : null;
   },
   issueSignedToken: async ({ pathname, operations }) => ({ delegationToken: `d:${pathname}:${operations}`, clientSigningToken: 'c' }),
   presignUrl: async (_t, { pathname }) => ({
@@ -472,4 +477,53 @@ test('a share without the service worker still lands on the upload page', async 
   const r = await fetch(bases[0] + '/share-target', { method: 'POST', body: new FormData(), redirect: 'manual' });
   assert.equal(r.status, 303);
   assert.equal(r.headers.get('location'), '/?shared=1');
+});
+
+// ---------- HTML links ----------
+async function htmlLink({ name = 'page.html', body = '<h1>مرحبا</h1>', uploadId = crypto.randomUUID(), ip = '10.0.0.9' } = {}) {
+  const size = Buffer.byteLength(body);
+  const headers = { 'x-real-ip': ip };
+  const r = await json('POST', '/api/html', { name, size, uploadId }, headers);
+  const res = { status: r.status, body: await r.json(), uploadId };
+  if (r.status !== 200 || res.body.done) return res;
+  blobs.set(res.body.pathname, { size, contentType: 'text/html', body }); // the browser's direct upload
+  const c = await json('POST', `/api/html/${res.body.id}/complete`, { uploadId }, headers);
+  return { status: c.status, body: await c.json(), uploadId, id: res.body.id };
+}
+
+test('html link: upload gives /p/<uuid> and the page is served sandboxed', async () => {
+  const { status, body } = await htmlLink();
+  assert.equal(status, 200);
+  assert.match(body.path, /^\/p\/[0-9a-f-]{36}$/);
+  assert.equal(body.name, 'page.html');
+  const r = await fetch(base() + body.path);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get('content-type'), /^text\/html; charset=utf-8/);
+  assert.match(r.headers.get('content-security-policy'), /^sandbox allow-scripts/);
+  assert.doesNotMatch(r.headers.get('content-security-policy'), /allow-same-origin/);
+  assert.equal(await r.text(), '<h1>مرحبا</h1>');
+});
+
+test('html link: retrying with the same upload id gives the same page', async () => {
+  const first = await htmlLink();
+  const again = await json('POST', '/api/html', { name: 'page.html', size: Buffer.byteLength('<h1>مرحبا</h1>'), uploadId: first.uploadId }, { 'x-real-ip': '10.0.0.9' });
+  const body = await again.json();
+  assert.equal(body.done, true);
+  assert.equal(body.path, first.body.path);
+});
+
+test('html link: only non-empty HTML files up to 10 MB', async () => {
+  const send = (name, size) => json('POST', '/api/html', { name, size, uploadId: crypto.randomUUID() }, { 'x-real-ip': '10.0.0.9' });
+  assert.equal((await (await send('a.txt', 10)).json()).code, 'not_html');
+  assert.equal((await (await send('a.htm', 0)).json()).code, 'empty_file');
+  assert.equal((await (await send('a.html', 10 * 1024 * 1024 + 1)).json()).code, 'too_large');
+});
+
+test('html link: unfinished upload, wrong upload id and unknown pages', async () => {
+  const uploadId = crypto.randomUUID();
+  const r = await (await json('POST', '/api/html', { name: 'x.html', size: 5, uploadId }, { 'x-real-ip': '10.0.0.9' })).json();
+  assert.equal((await json('POST', `/api/html/${r.id}/complete`, { uploadId }, { 'x-real-ip': '10.0.0.9' })).status, 400);
+  assert.equal((await json('POST', `/api/html/${r.id}/complete`, { uploadId: crypto.randomUUID() }, { 'x-real-ip': '10.0.0.9' })).status, 404);
+  assert.equal((await fetch(`${base()}/p/${r.id}`)).status, 404); // not live yet
+  assert.equal((await fetch(`${base()}/p/not-a-page`)).status, 404);
 });
