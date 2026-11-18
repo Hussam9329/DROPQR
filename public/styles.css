@@ -310,6 +310,7 @@ footer .legal { margin-top: 6px; }
 @media (max-width: 720px) {
   .nav-links { display: flex; }
   .nav-links a { display: none; }
+  .nav-links a.nav-keep { display: inline; white-space: nowrap; }
   .recent-row { flex-wrap: wrap; padding: 12px 16px; }
   .recent-row .meta { flex-basis: calc(100% - 48px); }
 }

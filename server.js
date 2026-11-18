@@ -10,6 +10,7 @@ const path = require('node:path');
 const { Readable, pipeline } = require('node:stream');
 const { promisify } = require('node:util');
 const downloadPage = require('./views/download-page');
+const textPage = require('./views/text-page');
 
 const scrypt = promisify(crypto.scrypt);
 
@@ -63,6 +64,29 @@ const ABUSE_EMAIL = process.env.ABUSE_EMAIL || '';
 // HTML links: one HTML file becomes a page with a link at /p/<uuid> that stops
 // working after the chosen time (same choices as shared files).
 const HTML_MAX_BYTES = 10 * 1024 * 1024;
+
+// Secret texts: encrypted in the browser, so the server only ever holds ciphertext.
+const TEXT_EXPIRY_OPTIONS = {
+  '5m': EXPIRY_OPTIONS['5m'],
+  '10m': EXPIRY_OPTIONS['10m'],
+  '15m': 15 * 60,
+  '30m': EXPIRY_OPTIONS['30m'],
+  '1h': EXPIRY_OPTIONS['1h'],
+  '6h': EXPIRY_OPTIONS['6h'],
+  '1d': EXPIRY_OPTIONS['1d'],
+  '7d': EXPIRY_OPTIONS['7d'],
+};
+// 10,000 characters of UTF-8 plus the AES-GCM tag, as base64url.
+const TEXT_MAX_CIPHERTEXT = 40100;
+const TEXT_STORAGE_CAP = 50 * 1024 * 1024;
+const TEXT_MAX_WRONG = 10;
+// A "delete after opening" text stays this long at most after the right password,
+// so a connection that drops mid-answer doesn't lose it.
+const TEXT_OPEN_WINDOW_SECONDS = 60;
+const TEXT_MIN_ITERATIONS = 100000;
+const TEXT_MAX_ITERATIONS = 2000000;
+// No 0, 1, I or O, so a code is easy to read and type.
+const TEXT_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
 // ---------- Database (Neon) ----------
 const sql = neon(process.env.DATABASE_URL);
@@ -130,6 +154,21 @@ function ensureSchema() {
     // Pages made before expiry existed have none and never expire.
     await query('ALTER TABLE pages ADD COLUMN IF NOT EXISTS expiry_seconds INTEGER');
     await query('ALTER TABLE pages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ');
+    // Secret texts. Holds only what the browser encrypted, never the text or its password.
+    await query(`CREATE TABLE IF NOT EXISTS texts (
+      id              TEXT PRIMARY KEY,
+      ciphertext      TEXT NOT NULL,
+      iv              TEXT NOT NULL,
+      salt            TEXT NOT NULL,
+      iterations      INTEGER NOT NULL,
+      verifier_hash   TEXT NOT NULL,
+      burn            BOOLEAN NOT NULL,
+      wrong_attempts  INTEGER NOT NULL DEFAULT 0,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at      TIMESTAMPTZ NOT NULL,
+      opened_at       TIMESTAMPTZ
+    )`);
+    await query('CREATE INDEX IF NOT EXISTS idx_texts_expires ON texts (expires_at)');
   })().catch((err) => { schemaReady = null; throw err; });
   return schemaReady;
 }
@@ -309,6 +348,7 @@ let lastCleanup = 0;
 async function cleanup() {
   lastCleanup = Date.now();
   await query("DELETE FROM usage_counters WHERE window_start <= now() - interval '1 day'");
+  await query('DELETE FROM texts WHERE expires_at <= now()');
   const pages = await query(`SELECT id, pathname FROM pages
     WHERE (status = 'pending' AND created_at <= now() - make_interval(secs => $1))
        OR (status = 'ready' AND expires_at <= now())
@@ -362,6 +402,8 @@ const downloadLimiter = limit('download', 15 * 60, 60);
 const apiLimiter = limit('api', 60, 120);
 const reportLimiter = limit('report', 60 * 60, 10);
 const adminLimiter = limit('admin', 15 * 60, 60);
+const textCreateLimiter = limit('text-create', 15 * 60, 30);
+const textOpenLimiter = limit('text-open', 15 * 60, 40);
 
 function requireAdmin(req, res, next) {
   const secret = process.env.ADMIN_SECRET;
@@ -741,6 +783,147 @@ app.get('/p/:id', h(async (req, res) => {
   res.removeHeader('X-Frame-Options');
   pipeline(Readable.fromWeb(blob.stream), res, (err) => { if (err) console.error('page stream failed', err); });
 }));
+
+// ---------- Secret texts ----------
+// The browser encrypts the text with a key made from the password, and sends a
+// separate "verifier" made from the same password. The server can check the
+// verifier but can't get the key from it, so it can never read a text.
+const isBase64Url = (value, bytes) => typeof value === 'string'
+  && value.length === Math.ceil(bytes * 4 / 3) && /^[A-Za-z0-9_-]+$/.test(value);
+
+function newTextCode() {
+  return Array.from(crypto.randomBytes(8), (b) => TEXT_CODE_ALPHABET[b & 31]).join('');
+}
+
+// Accepts a code however it was typed: "k7m2-qx9p" is "K7M2QX9P".
+const textCode = (value) => String(value || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+
+// Loads a text that can still be opened, or answers why it can't.
+async function activeText(req, res) {
+  const [row] = await query('SELECT * FROM texts WHERE id = $1', [textCode(req.params.id)]);
+  if (!row) {
+    fail(res, 404, 'not_found', 'This text does not exist or was deleted.');
+    return null;
+  }
+  if (new Date(row.expires_at).getTime() <= Date.now()) {
+    await query('DELETE FROM texts WHERE id = $1', [row.id]);
+    fail(res, 410, 'expired', 'This text has expired.');
+    return null;
+  }
+  return row;
+}
+
+// True if the verifier is right. Wrong guesses are counted on the text itself,
+// whoever sends them, and the last allowed one deletes it.
+async function checkTextVerifier(req, res, row) {
+  const verifier = req.body?.verifier;
+  if (isBase64Url(verifier, 32) && await passwordMatches(verifier, row.verifier_hash)) return true;
+  const [counted] = await query('UPDATE texts SET wrong_attempts = wrong_attempts + 1 WHERE id = $1 RETURNING wrong_attempts', [row.id]);
+  if (!counted) {
+    fail(res, 404, 'not_found', 'This text does not exist or was deleted.');
+    return false;
+  }
+  if (counted.wrong_attempts >= TEXT_MAX_WRONG) {
+    await query('DELETE FROM texts WHERE id = $1', [row.id]);
+    fail(res, 410, 'destroyed', 'Too many wrong passwords. This text was deleted.');
+    return false;
+  }
+  fail(res, 403, 'wrong_password', 'Wrong password.', { attemptsLeft: TEXT_MAX_WRONG - counted.wrong_attempts });
+  return false;
+}
+
+app.use('/api/texts', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+
+// Body: { ciphertext, iv, salt, iterations, verifier, expiry, burn }, all made in the browser.
+app.post('/api/texts', textCreateLimiter, h(async (req, res) => {
+  const { ciphertext, iv, salt, iterations, verifier, expiry, burn } = req.body || {};
+  const seconds = Object.hasOwn(TEXT_EXPIRY_OPTIONS, String(expiry)) ? TEXT_EXPIRY_OPTIONS[expiry] : 0;
+  if (!seconds || typeof burn !== 'boolean') return fail(res, 400, 'invalid_options', 'Invalid expiry.');
+  if (typeof ciphertext !== 'string' || !/^[A-Za-z0-9_-]+$/.test(ciphertext) || ciphertext.length < 23) {
+    return fail(res, 400, 'bad_request', 'Invalid text.');
+  }
+  if (ciphertext.length > TEXT_MAX_CIPHERTEXT) return fail(res, 400, 'too_large', 'The text is too long.');
+  if (!isBase64Url(iv, 12) || !isBase64Url(salt, 16) || !isBase64Url(verifier, 32)
+    || !Number.isInteger(iterations) || iterations < TEXT_MIN_ITERATIONS || iterations > TEXT_MAX_ITERATIONS) {
+    return fail(res, 400, 'bad_request', 'Invalid text.');
+  }
+  const [{ used }] = await query('SELECT COALESCE(SUM(length(ciphertext)), 0) AS used FROM texts');
+  if (Number(used) + ciphertext.length > TEXT_STORAGE_CAP) {
+    return fail(res, 503, 'service_full', 'The service is full right now. Please try again later.');
+  }
+
+  const verifierHash = await hashPassword(verifier);
+  let row;
+  for (let tries = 0; !row && tries < 5; tries++) {
+    [row] = await query(`INSERT INTO texts (id, ciphertext, iv, salt, iterations, verifier_hash, burn, expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8))
+      ON CONFLICT (id) DO NOTHING RETURNING id, expires_at`,
+    [newTextCode(), ciphertext, iv, salt, iterations, verifierHash, burn, seconds]);
+  }
+  if (!row) throw new Error('could not reserve a text code');
+
+  cleanupSoon();
+  const url = `${baseUrlFor(req)}/t/${row.id}`;
+  const qrPng = await QRCode.toDataURL(url, { errorCorrectionLevel: 'M', margin: 1, width: 600, color: { dark: '#0b1020', light: '#ffffff' } });
+  res.status(201).json({ id: row.id, url, qrPng, burn, expiresAt: new Date(row.expires_at).getTime(), serverNow: Date.now() });
+}));
+
+// What the browser needs to ask for the password. Reveals nothing about the text.
+app.get('/api/texts/:id', apiLimiter, h(async (req, res) => {
+  const row = await activeText(req, res);
+  if (!row) return;
+  res.json({
+    id: row.id, salt: row.salt, iterations: row.iterations, burn: row.burn,
+    expiresAt: new Date(row.expires_at).getTime(), serverNow: Date.now(),
+  });
+}));
+
+// The right password gets the encrypted text. A "delete after opening" text then
+// has a short window left, and the browser ends it early with /burn once it has the text.
+app.post('/api/texts/:id/open', textOpenLimiter, h(async (req, res) => {
+  const found = await activeText(req, res);
+  if (!found || !(await checkTextVerifier(req, res, found))) return;
+  cleanupSoon();
+  const [row] = found.burn
+    ? await query(`UPDATE texts SET opened_at = COALESCE(opened_at, now()),
+        expires_at = LEAST(expires_at, COALESCE(opened_at, now()) + make_interval(secs => $2))
+      WHERE id = $1 AND expires_at > now() RETURNING *`, [found.id, TEXT_OPEN_WINDOW_SECONDS])
+    : [found];
+  if (!row) return fail(res, 410, 'expired', 'This text has expired.');
+  res.json({
+    ciphertext: row.ciphertext, iv: row.iv, burn: row.burn,
+    expiresAt: new Date(row.expires_at).getTime(), serverNow: Date.now(),
+  });
+}));
+
+// The browser has the text: a "delete after opening" text is gone from here on.
+// Safe to repeat: a text that is already gone counts as done.
+app.post('/api/texts/:id/burn', textOpenLimiter, h(async (req, res) => {
+  const [row] = await query('SELECT * FROM texts WHERE id = $1', [textCode(req.params.id)]);
+  if (!row) return res.json({ ok: true, deleted: true });
+  if (!(await checkTextVerifier(req, res, row))) return;
+  if (row.burn) await query('DELETE FROM texts WHERE id = $1', [row.id]);
+  res.json({ ok: true, deleted: row.burn });
+}));
+
+// The pages hold no secrets: the text is only fetched after the password is given,
+// so link previews and scanners can't open or use up a text.
+function sendTextPage(res, mode, code = '') {
+  res.set({
+    'Cache-Control': 'no-store',
+    'X-Robots-Tag': 'noindex',
+    'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  });
+  res.type('html').send(textPage({ mode, code }));
+}
+app.get('/text', (_req, res) => sendTextPage(res, 'create'));
+app.get('/t/:id', (req, res) => {
+  const code = textCode(req.params.id);
+  sendTextPage(res, 'open', /^[2-9A-HJ-NP-Z]{8}$/.test(code) ? code : '');
+});
 
 // Phone "Share to DropQR": the service worker normally answers this itself.
 // Without it (e.g. the very first open) the visitor still lands on the upload page.

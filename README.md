@@ -26,6 +26,12 @@ Upload one HTML file (up to 10 MB) and get a link to the page at `/p/<uuid>`. Th
 `POST /api/html` (with `expiry`) reserves the page and returns an upload token (the same `uploadId` always returns the same page, so retries are safe), the browser uploads the file straight to Blob, and `POST /api/html/:id/complete` makes it live.
 `/p/:id` serves the page under `Content-Security-Policy: sandbox`, so its scripts run in their own blank origin and can't reach DropQR's API, cookies or storage. Pages count toward `STORAGE_CAP_GB` and `DAILY_UPLOAD_MB`.
 
+## Secret texts (`/text`)
+
+Write a text (up to 10,000 characters), give it a password and a lifetime (5 minutes to 7 days), and get a link, QR code and short code at `/t/<code>`.
+The browser encrypts the text (`public/text.js`: PBKDF2-SHA-256, then AES-256-GCM). The server stores only the ciphertext and a scrypt hash of a verifier derived from the password, so it can't read a text, and a forgotten password can't be recovered.
+With "delete after opening", the right password starts a 60-second window at most, and the browser ends it with `POST /api/texts/:code/burn` once it has the text. Ten wrong passwords delete the text. Expired texts are refused at once and removed by the next cleanup.
+
 Expiry: 5m, 10m, 30m, 1h, 6h, 12h, 1d, 3d, 7d. Download limit: 1–100.
 
 ## Run locally

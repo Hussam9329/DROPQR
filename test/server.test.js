@@ -561,3 +561,148 @@ test('html link: pages made before expiry existed keep working', async () => {
   await pg.query('UPDATE pages SET expiry_seconds = NULL, expires_at = NULL WHERE id = $1', [id]);
   assert.equal((await fetch(base() + body.path)).status, 200);
 });
+
+// ---------- Secret texts ----------
+const b64 = (bytes, fill = 7) => Buffer.alloc(bytes, fill).toString('base64url');
+const RIGHT = b64(32, 1);
+const WRONG = b64(32, 2);
+const textIp = { 'x-real-ip': '10.0.0.20' };
+
+async function secretText(extra = {}) {
+  await pg.query('DELETE FROM usage_counters');
+  const r = await json('POST', '/api/texts', {
+    ciphertext: b64(40), iv: b64(12), salt: b64(16), iterations: 600000,
+    verifier: RIGHT, expiry: '15m', burn: true, ...extra,
+  }, textIp);
+  return { status: r.status, body: await r.json() };
+}
+const openText = (id, verifier = RIGHT, ip = textIp) => json('POST', `/api/texts/${id}/open`, { verifier }, ip);
+
+test('secret text: gives a code, link and QR, and stores nothing readable', async () => {
+  const { status, body } = await secretText();
+  assert.equal(status, 201);
+  assert.match(body.id, /^[2-9A-HJ-NP-Z]{8}$/);
+  assert.ok(body.url.endsWith(`/t/${body.id}`));
+  assert.match(body.qrPng, /^data:image\/png;base64,/);
+  const minutes = (body.expiresAt - Date.now()) / 60000;
+  assert.ok(minutes > 14.9 && minutes <= 15, `expires in ${minutes} minutes`);
+  const [row] = (await pg.query('SELECT * FROM texts WHERE id = $1', [body.id])).rows;
+  assert.match(row.verifier_hash, /^scrypt:/);
+  assert.ok(!row.verifier_hash.includes(RIGHT));
+});
+
+test('secret text: only valid options and encrypted data are accepted', async () => {
+  assert.equal((await secretText({ expiry: '2y' })).body.code, 'invalid_options');
+  assert.equal((await secretText({ expiry: 'constructor' })).body.code, 'invalid_options');
+  assert.equal((await secretText({ burn: 'yes' })).body.code, 'invalid_options');
+  assert.equal((await secretText({ ciphertext: 'plain text!' })).body.code, 'bad_request');
+  assert.equal((await secretText({ iv: 'short' })).body.code, 'bad_request');
+  assert.equal((await secretText({ verifier: 'short' })).body.code, 'bad_request');
+  assert.equal((await secretText({ iterations: 10 })).body.code, 'bad_request');
+  assert.equal((await secretText({ ciphertext: 'a'.repeat(40101) })).body.code, 'too_large');
+});
+
+test('secret text: details reveal nothing until the right password', async () => {
+  const { body } = await secretText();
+  const meta = await (await json('GET', `/api/texts/${body.id}`, null, textIp)).json();
+  assert.equal(meta.burn, true);
+  assert.equal(meta.ciphertext, undefined);
+  assert.equal(meta.iv, undefined);
+  assert.equal(meta.verifier_hash, undefined);
+  const wrong = await openText(body.id, WRONG);
+  assert.equal(wrong.status, 403);
+  const failed = await wrong.json();
+  assert.equal(failed.code, 'wrong_password');
+  assert.equal(failed.attemptsLeft, 9);
+  assert.equal(failed.ciphertext, undefined);
+  const ok = await openText(body.id);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get('cache-control'), 'no-store');
+  assert.equal((await ok.json()).ciphertext, b64(40));
+});
+
+test('secret text: a code works however it is typed', async () => {
+  const { body } = await secretText();
+  const typed = `${body.id.slice(0, 4)}-${body.id.slice(4)}`.toLowerCase();
+  assert.equal((await json('GET', `/api/texts/${typed}`, null, textIp)).status, 200);
+});
+
+test('secret text: delete after opening removes it once the browser has it', async () => {
+  const { body } = await secretText();
+  assert.equal((await openText(body.id)).status, 200);
+  assert.equal((await json('POST', `/api/texts/${body.id}/burn`, { verifier: WRONG }, textIp)).status, 403);
+  assert.equal((await pg.query('SELECT 1 FROM texts WHERE id = $1', [body.id])).rows.length, 1);
+  const burned = await json('POST', `/api/texts/${body.id}/burn`, { verifier: RIGHT }, textIp);
+  assert.deepEqual(await burned.json(), { ok: true, deleted: true });
+  assert.equal((await pg.query('SELECT 1 FROM texts WHERE id = $1', [body.id])).rows.length, 0);
+  assert.equal((await openText(body.id)).status, 404);
+  assert.equal((await json('GET', `/api/texts/${body.id}`, null, textIp)).status, 404);
+  assert.equal((await json('POST', `/api/texts/${body.id}/burn`, { verifier: RIGHT }, textIp)).status, 200); // a retry is fine
+});
+
+test('secret text: a lost connection leaves 60 seconds at most, and reopening never extends it', async () => {
+  const { body } = await secretText({ expiry: '7d' });
+  const first = await (await openText(body.id)).json();
+  const left = (first.expiresAt - Date.now()) / 1000;
+  assert.ok(left > 55 && left <= 60, `${left} seconds left`);
+  await pg.query("UPDATE texts SET opened_at = now() - interval '50 seconds', expires_at = now() + interval '10 seconds' WHERE id = $1", [body.id]);
+  const second = await (await openText(body.id)).json(); // the page was reloaded
+  assert.equal(second.ciphertext, b64(40));
+  assert.ok(second.expiresAt - Date.now() <= 10000);
+  await pg.query("UPDATE texts SET expires_at = now() - interval '1 second' WHERE id = $1", [body.id]);
+  assert.equal((await openText(body.id)).status, 410);
+  assert.equal((await pg.query('SELECT 1 FROM texts WHERE id = $1', [body.id])).rows.length, 0);
+});
+
+test('secret text: without delete after opening it can be read until its time is up', async () => {
+  const { body } = await secretText({ burn: false });
+  for (let i = 0; i < 3; i++) assert.equal((await openText(body.id)).status, 200);
+  const burned = await json('POST', `/api/texts/${body.id}/burn`, { verifier: RIGHT }, textIp);
+  assert.equal((await burned.json()).deleted, false);
+  const [row] = (await pg.query('SELECT opened_at FROM texts WHERE id = $1', [body.id])).rows;
+  assert.equal(row.opened_at, null);
+  assert.equal((await openText(body.id)).status, 200);
+});
+
+test('secret text: expired texts stop working and cleanup deletes them', async () => {
+  const late = (await secretText({ burn: false })).body;
+  const unread = (await secretText({ burn: false })).body;
+  await pg.query("UPDATE texts SET expires_at = now() - interval '1 second' WHERE id = ANY($1)", [[late.id, unread.id]]);
+  assert.equal((await json('GET', `/api/texts/${late.id}`, null, textIp)).status, 410);
+  const r = await json('GET', '/api/cron/cleanup', null, { authorization: 'Bearer test-secret' });
+  assert.equal(r.status, 200);
+  assert.equal((await pg.query('SELECT 1 FROM texts WHERE id = ANY($1)', [[late.id, unread.id]])).rows.length, 0);
+});
+
+test('secret text: 10 wrong passwords delete it, even from different visitors', async () => {
+  const { body } = await secretText();
+  for (let i = 1; i <= 9; i++) {
+    const r = await openText(body.id, WRONG, { 'x-real-ip': `10.1.0.${i}` });
+    assert.equal(r.status, 403);
+    assert.equal((await r.json()).attemptsLeft, 10 - i);
+  }
+  const last = await openText(body.id, WRONG, { 'x-real-ip': '10.1.0.10' });
+  assert.equal(last.status, 410);
+  assert.equal((await last.json()).code, 'destroyed');
+  assert.equal((await openText(body.id)).status, 404);
+  assert.equal((await pg.query('SELECT 1 FROM texts WHERE id = $1', [body.id])).rows.length, 0);
+});
+
+test('secret text: guessing through the delete step counts too', async () => {
+  const { body } = await secretText();
+  const r = await json('POST', `/api/texts/${body.id}/burn`, { verifier: WRONG }, textIp);
+  assert.equal((await r.json()).attemptsLeft, 9);
+});
+
+test('secret text: pages are strict and carry no secret', async () => {
+  const { body } = await secretText();
+  const r = await fetch(`${base()}/t/${body.id}`);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get('content-security-policy'), /default-src 'none'; script-src 'self'/);
+  assert.equal(r.headers.get('x-robots-tag'), 'noindex');
+  assert.ok(!(await r.text()).includes(b64(40)));
+  assert.equal((await pg.query('SELECT opened_at FROM texts WHERE id = $1', [body.id])).rows[0].opened_at, null); // previews use nothing
+  const odd = await (await fetch(`${base()}/t/%22%3E%3Cscript%3E`)).text();
+  assert.ok(odd.includes('data-code=""'));
+  assert.equal((await fetch(`${base()}/text`)).status, 200);
+});
