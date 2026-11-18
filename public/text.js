@@ -3,6 +3,7 @@
 // which proves the password without revealing the key.
 (() => {
   const $ = (id) => document.getElementById(id);
+  const { counted, timeLeft } = RecentLinks;
   const ITERATIONS = 600000;
   const MIN_PASSWORD = 4;
   const encoder = new TextEncoder();
@@ -70,26 +71,19 @@
     setTimeout(() => { button.textContent = label; }, 2000);
   }
 
-  // Arabic counts: 1 and 11+ take the singular, 3 to 10 the plural.
-  const counted = (n, one, two, few) => {
-    if (n === 1) return one;
-    if (n === 2) return two;
-    return `${n} ${n <= 10 ? few : one}`;
-  };
-
-  function timeLeft(ms) {
-    const minutes = Math.max(1, Math.ceil(ms / 60000));
-    if (minutes < 60) return counted(minutes, 'دقيقة', 'دقيقتين', 'دقائق');
-    const hours = Math.round(minutes / 60);
-    if (hours < 24) return counted(hours, 'ساعة', 'ساعتين', 'ساعات');
-    return counted(Math.round(hours / 24), 'يوم', 'يومين', 'أيام');
-  }
-
   // ---------- Write a text ----------
   function startCreate() {
     let expiry = '15m';
     let link = '';
     let code = '';
+
+    const recent = RecentLinks.mount({
+      container: $('recent'),
+      storageKey: 'dropqr:texts',
+      apiPath: '/api/texts',
+      statusText: (meta) => `${meta.burn ? 'يختفي بعد أول فتح · ' : ''}ينتهي بعد ${timeLeft(meta.expiresAt - meta.serverNow)}`,
+      remove: (item) => fetch(`/api/texts/${encodeURIComponent(item.id)}`, { method: 'DELETE', headers: { 'X-Delete-Token': item.deleteToken } }),
+    });
 
     $('expiry').replaceChildren(...EXPIRY.map(([key, label]) => {
       const chip = document.createElement('button');
@@ -138,7 +132,9 @@
         $('made-note').textContent = data.burn
           ? `ينمسح أول ما ينفتح، أو بعد ${left} إذا محد فتحه.`
           : `يبقى ${left}، وينفتح بالباسورد خلال هذي المدة.`;
+        recent.add({ id: data.id, url: data.url, name: $('label').value.trim() || code, deleteToken: data.deleteToken });
         $('body').value = '';
+        $('label').value = '';
         $('password').value = '';
         $('count').textContent = '0';
         $('create').hidden = true;
@@ -227,7 +223,7 @@
           if (!ok) {
             if (data.code === 'wrong_password') {
               $('password').select();
-              return showError(`الباسورد غلط. باقي ${data.attemptsLeft} محاولة وبعدها ينمسح النص.`);
+              return showError(`الباسورد غلط. باقي ${counted(data.attemptsLeft, 'محاولة', 'محاولتين', 'محاولات')} وبعدها ينمسح النص.`);
             }
             if (data.code === 'destroyed') return gone('انمسح النص بسبب كثرة المحاولات الغلط.');
             if (status === 429) return showError(MESSAGES.rate_limited);

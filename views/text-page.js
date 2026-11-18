@@ -15,6 +15,12 @@ const createView = `
       </label>
 
       <label class="field">
+        <span>اسم للتذكير (اختياري)</span>
+        <input id="label" maxlength="60" dir="auto" autocomplete="off" placeholder="مثلاً: يوزر العمل">
+        <small>يظهر بقائمتك فقط، وينحفظ بهذا المتصفح وما يوصل للسيرفر.</small>
+      </label>
+
+      <label class="field">
         <span>الباسورد</span>
         <span class="password">
           <input id="password" type="password" minlength="4" maxlength="100" required autocomplete="new-password" placeholder="4 أحرف أو أكثر">
@@ -100,13 +106,15 @@ module.exports = function textPage({ mode, code }) {
   <meta property="og:description" content="نص محمي بباسورد، ينمسح تلقائياً.">
   <link rel="icon" href="/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/text.css">
+  <link rel="stylesheet" href="/recent-links.css">
 </head>
 <body data-mode="${mode}" data-code="${code}">
   <main class="shell">
     <section class="card">${mode === 'open' ? openView : createView}
-    </section>
+    </section>${mode === 'open' ? '' : '\n    <section id="recent" class="recent-links" hidden></section>'}
     <a class="back" href="/">DropQR</a>
   </main>
+  <script src="/recent-links.js"></script>
   <script src="/text.js"></script>
 </body>
 </html>`;

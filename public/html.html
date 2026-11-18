@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#090d16"><title>رابط HTML</title><link rel="icon" href="/logo.svg" type="image/svg+xml"><style>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#090d16"><title>رابط HTML</title><link rel="icon" href="/logo.svg" type="image/svg+xml"><link rel="stylesheet" href="/recent-links.css"><style>
 :root{color-scheme:dark;--bg:#090d16;--panel:#131a28;--line:#263247;--text:#f5f7fc;--muted:#94a3b8;--blue:#4383ff}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:"Segoe UI",Tahoma,Arial,sans-serif}button,input,a{font:inherit}button,a,label{touch-action:manipulation}button{cursor:pointer}a{color:inherit;text-decoration:none}
 .shell{min-height:100vh;min-height:100svh;display:grid;place-items:center;padding:24px 16px;background:radial-gradient(ellipse at 50% 0%,#13233d 0,transparent 60%)}.card{width:min(100%,460px);min-width:0;background:linear-gradient(155deg,#172033,#111724);border:1px solid #273349;border-radius:26px;padding:30px;box-shadow:0 22px 70px #0005}.heading{display:flex;justify-content:center;align-items:center;gap:12px;margin-bottom:28px}.heading h1{font-size:26px;font-weight:750;margin:0;line-height:1.4}.brand-icon{display:grid;place-items:center;background:linear-gradient(140deg,#508dff,#3262db);height:47px;width:47px;border-radius:14px;box-shadow:0 8px 22px #2856c52e}
@@ -10,6 +10,7 @@
 @keyframes spin{to{transform:rotate(360deg)}}@keyframes appear{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}@media(max-width:400px){.card{padding:24px 20px;border-radius:22px}.heading h1{font-size:24px}.actions{grid-template-columns:1fr 1fr}.actions button,.actions a{font-size:15px;gap:7px}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 
 .expiry{margin-bottom:16px}.expiry-label{font-size:14px;color:var(--muted);margin-bottom:9px}.chips{display:flex;flex-wrap:wrap;gap:7px}.chip{min-height:38px;padding:0 13px;border-radius:10px;border:1px solid #35445e;background:#1d2a40;color:#d3e0f7;font-size:14px;transition:background .15s,border-color .15s}.chip:hover{border-color:#70a4ff}.chip[aria-pressed="true"]{background:#3878ef;border-color:#508dff;color:#fff}.expires{font-size:14px;color:#b7c5dc;margin:-4px 0 14px}
+.shell{align-content:center;gap:20px}.recent-links{--recent-width:460px}
 [hidden]{display:none!important}.link-symbol{font:700 27px monospace}.drop-zone{width:100%}.upload-icon{font-size:32px}.file-row{overflow-wrap:anywhere}.url-field{box-sizing:border-box}button{color:inherit}
 </style></head><body><main class="shell"><section class="card">
 <header class="heading"><span class="brand-icon link-symbol">↗</span><h1>رابط HTML</h1></header>
@@ -19,7 +20,7 @@
 <div id="busy" class="upload-state" role="status" hidden><span class="spinner"></span><strong>جاري رفع الملف…</strong><span id="uploadName" class="upload-name" dir="auto"></span><div id="progress" class="progress" role="progressbar" aria-label="تقدم الرفع" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="bar"></span></div></div>
 <div id="result" class="result" aria-live="polite" hidden><div class="ready"><span>✓</span><strong>رابطك جاهز</strong></div><div id="name" class="file-row" dir="auto"></div><div id="expires" class="expires" hidden></div><input id="url" class="url-field" readonly dir="ltr" aria-label="رابط الملف"><div class="actions"><button id="copy" type="button" class="primary">نسخ الرابط</button><a id="open" class="secondary" target="_blank" rel="noopener noreferrer">فتح ↗</a></div><button id="another" class="another" type="button">رفع ملف آخر</button></div>
 <div id="error" class="error" role="alert" hidden></div><button id="retry" class="retry" type="button" hidden>إعادة المحاولة</button>
-</section></main><script src="/vendor/blob-upload.js"></script><script>
+</section><section id="recent" class="recent-links" hidden></section></main><script src="/vendor/blob-upload.js"></script><script src="/recent-links.js"></script><script>
 (() => {
   // Same flow as before, on DropQR: reserve the page, upload the file straight
   // to storage (with progress), then confirm it. A retry reuses the same upload id.
@@ -27,6 +28,9 @@
   const MESSAGES={invalid_options:'اختر مدة صالحة.',rate_limited:'طلبات كثيرة. انتظر قليلاً وأعد المحاولة.',daily_limit:'وصلت حد الرفع اليومي. حاول غداً.',service_full:'الخدمة ممتلئة الآن. حاول لاحقاً.',too_large:'حجم الملف أكبر من 10 ميغابايت.',empty_file:'الملف فارغ. اختر ملفاً آخر.',not_html:'اختر ملف HTML.'};
   const LABELS={'5m':'5 دقائق','10m':'10 دقائق','30m':'30 دقيقة','1h':'ساعة','6h':'6 ساعات','12h':'12 ساعة','1d':'يوم','3d':'3 أيام','7d':'7 أيام'}, PREF='dropqr:html-expiry';
   let pending=null, xhr=null, link='', timer, expiry='1h';
+  const recent=RecentLinks.mount({container:$('recent'),storageKey:'dropqr:html-links',apiPath:'/api/html',
+    statusText:meta=>meta.expiresAt?'ينتهي بعد '+RecentLinks.timeLeft(meta.expiresAt-meta.serverNow):'يعمل',
+    remove:item=>fetch('/api/html/'+encodeURIComponent(item.id),{method:'DELETE',headers:{'X-Upload-Id':item.uploadId}})});
   try{const saved=localStorage.getItem(PREF);if(LABELS[saved])expiry=saved;}catch{}
   function chips(options){
     if(!options.includes(expiry))expiry=options.includes('1h')?'1h':options[0];
@@ -66,7 +70,7 @@
         data=await post('/api/html/'+data.id+'/complete',{uploadId:pending.id},active.signal);
       }
       if(!/^\/p\/[a-f0-9-]{36}$/.test(data.path||''))return fail('تعذر قراءة الرابط. أعد المحاولة.');
-      xhr=null;link=new URL(data.path,location.origin).href;$('url').value=link;$('open').href=link;$('name').textContent=data.name;$('expires').hidden=!data.expiresAt;if(data.expiresAt)$('expires').textContent='ينتهي: '+new Intl.DateTimeFormat('ar',{dateStyle:'medium',timeStyle:'short'}).format(new Date(data.expiresAt));$('file').value='';state('result');error('');
+      xhr=null;link=new URL(data.path,location.origin).href;$('url').value=link;$('open').href=link;$('name').textContent=data.name;$('expires').hidden=!data.expiresAt;if(data.expiresAt)$('expires').textContent='ينتهي: '+new Intl.DateTimeFormat('ar',{dateStyle:'medium',timeStyle:'short'}).format(new Date(data.expiresAt));$('file').value='';recent.add({id:data.path.slice(3),url:link,name:data.name,uploadId:pending.id});state('result');error('');
     }catch(err){
       if(active.signal.aborted)return fail('تأخر الرفع. أعد المحاولة.');
       if(err.known)return fail(err.message);

@@ -32,6 +32,11 @@ Write a text (up to 10,000 characters), give it a password and a lifetime (5 min
 The browser encrypts the text (`public/text.js`: PBKDF2-SHA-256, then AES-256-GCM). The server stores only the ciphertext and a scrypt hash of a verifier derived from the password, so it can't read a text, and a forgotten password can't be recovered.
 With "delete after opening", the right password starts a 60-second window at most, and the browser ends it with `POST /api/texts/:code/burn` once it has the text. Ten wrong passwords delete the text. Expired texts are refused at once and removed by the next cleanup.
 
+## Your recent links
+
+The HTML and secret text pages list what this browser made (`public/recent-links.js`, saved in local storage, up to 20 each), with open, copy, QR and delete. Each row is checked with `GET /api/html/:id` or `GET /api/texts/:code`, which never uses up a text, and leaves the list once it expired or was deleted.
+Deleting early is `DELETE /api/html/:id` with the page's upload id (`X-Upload-Id`), or `DELETE /api/texts/:code` with the text's delete token (`X-Delete-Token`). A delete token can't open the text.
+
 Expiry: 5m, 10m, 30m, 1h, 6h, 12h, 1d, 3d, 7d. Download limit: 1–100.
 
 ## Run locally

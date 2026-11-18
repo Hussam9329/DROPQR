@@ -169,6 +169,8 @@ function ensureSchema() {
       opened_at       TIMESTAMPTZ
     )`);
     await query('CREATE INDEX IF NOT EXISTS idx_texts_expires ON texts (expires_at)');
+    // Lets the browser that wrote a text delete it early. It can't open the text.
+    await query('ALTER TABLE texts ADD COLUMN IF NOT EXISTS delete_token TEXT');
   })().catch((err) => { schemaReady = null; throw err; });
   return schemaReady;
 }
@@ -266,6 +268,9 @@ async function shareLink(req, id) {
   ]);
   return { url, qrSvg, qrPng };
 }
+
+// The QR code for a saved HTML link or secret text.
+const qrPngFor = (url) => QRCode.toDataURL(url, { errorCorrectionLevel: 'M', margin: 1, width: 600, color: { dark: '#0b1020', light: '#ffffff' } });
 
 function isActive(row) {
   return row && row.status === 'ready' && new Date(row.expires_at).getTime() > Date.now()
@@ -760,6 +765,31 @@ app.post('/api/html/:id/complete', completeLimiter, h(async (req, res) => {
   res.json(pageResult(page));
 }));
 
+// Whether a saved link still works. With ?share=1 it also returns the link and QR code.
+app.get('/api/html/:id', apiLimiter, h(async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const [row] = /^[0-9a-f-]{36}$/.test(req.params.id)
+    ? await query("SELECT * FROM pages WHERE id = $1 AND status = 'ready'", [req.params.id])
+    : [];
+  if (!row) return fail(res, 404, 'not_found', 'This link does not exist or was removed.');
+  if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) return fail(res, 410, 'expired', 'This link has expired.');
+  const url = `${baseUrlFor(req)}${pageResult(row).path}`;
+  res.json({ ...pageResult(row), serverNow: Date.now(), ...(req.query.share ? { url, qrPng: await qrPngFor(url) } : {}) });
+}));
+
+// Deletes a page early. Only the browser that uploaded it knows its upload id.
+// Storage first: if that fails the row stays, so the delete can be retried.
+app.delete('/api/html/:id', apiLimiter, h(async (req, res) => {
+  const [row] = /^[0-9a-f-]{36}$/.test(req.params.id)
+    ? await query('SELECT * FROM pages WHERE id = $1', [req.params.id])
+    : [];
+  if (!row) return fail(res, 404, 'not_found', 'This link does not exist or was removed.');
+  if (!sameSecret(req.get('x-upload-id') || '', row.upload_id)) return fail(res, 403, 'not_allowed', 'Not allowed.');
+  await del(row.pathname);
+  await query('DELETE FROM pages WHERE id = $1', [row.id]);
+  res.json({ ok: true });
+}));
+
 // The page itself. It runs in a sandbox (its own blank origin), so its scripts
 // can't reach DropQR's API, cookies or browser storage.
 app.get('/p/:id', h(async (req, res) => {
@@ -856,29 +886,46 @@ app.post('/api/texts', textCreateLimiter, h(async (req, res) => {
   }
 
   const verifierHash = await hashPassword(verifier);
+  const deleteToken = newToken();
   let row;
   for (let tries = 0; !row && tries < 5; tries++) {
-    [row] = await query(`INSERT INTO texts (id, ciphertext, iv, salt, iterations, verifier_hash, burn, expires_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8))
+    [row] = await query(`INSERT INTO texts (id, ciphertext, iv, salt, iterations, verifier_hash, burn, expires_at, delete_token)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8), $9)
       ON CONFLICT (id) DO NOTHING RETURNING id, expires_at`,
-    [newTextCode(), ciphertext, iv, salt, iterations, verifierHash, burn, seconds]);
+    [newTextCode(), ciphertext, iv, salt, iterations, verifierHash, burn, seconds, deleteToken]);
   }
   if (!row) throw new Error('could not reserve a text code');
 
   cleanupSoon();
   const url = `${baseUrlFor(req)}/t/${row.id}`;
-  const qrPng = await QRCode.toDataURL(url, { errorCorrectionLevel: 'M', margin: 1, width: 600, color: { dark: '#0b1020', light: '#ffffff' } });
-  res.status(201).json({ id: row.id, url, qrPng, burn, expiresAt: new Date(row.expires_at).getTime(), serverNow: Date.now() });
+  res.status(201).json({
+    id: row.id, url, qrPng: await qrPngFor(url), burn, deleteToken,
+    expiresAt: new Date(row.expires_at).getTime(), serverNow: Date.now(),
+  });
 }));
 
-// What the browser needs to ask for the password. Reveals nothing about the text.
+// What the browser needs to ask for the password. Reveals nothing about the text,
+// and looking never uses it up. With ?share=1 it also returns the link and QR code.
 app.get('/api/texts/:id', apiLimiter, h(async (req, res) => {
   const row = await activeText(req, res);
   if (!row) return;
+  const url = `${baseUrlFor(req)}/t/${row.id}`;
   res.json({
     id: row.id, salt: row.salt, iterations: row.iterations, burn: row.burn,
     expiresAt: new Date(row.expires_at).getTime(), serverNow: Date.now(),
+    ...(req.query.share ? { url, qrPng: await qrPngFor(url) } : {}),
   });
+}));
+
+// Deletes a text early, for the browser that wrote it.
+app.delete('/api/texts/:id', apiLimiter, h(async (req, res) => {
+  const [row] = await query('SELECT id, delete_token FROM texts WHERE id = $1', [textCode(req.params.id)]);
+  if (!row) return fail(res, 404, 'not_found', 'This text does not exist or was deleted.');
+  if (!row.delete_token || !sameSecret(req.get('x-delete-token') || '', row.delete_token)) {
+    return fail(res, 403, 'not_allowed', 'Not allowed.');
+  }
+  await query('DELETE FROM texts WHERE id = $1', [row.id]);
+  res.json({ ok: true });
 }));
 
 // The right password gets the encrypted text. A "delete after opening" text then

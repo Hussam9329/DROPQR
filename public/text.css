@@ -24,7 +24,7 @@ button { cursor: pointer; touch-action: manipulation; }
 button:disabled { cursor: wait; opacity: .65; }
 :focus-visible { outline: 3px solid #79a8ff; outline-offset: 2px; }
 
-.shell { min-height: 100vh; min-height: 100svh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px 16px; }
+.shell { min-height: 100vh; min-height: 100svh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; padding: 24px 16px; }
 .card { width: min(100%, 500px); min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 20px; padding: 28px; }
 .back { color: var(--muted); font-size: 14px; text-decoration: none; padding: 8px; }
 .back:hover { color: var(--text); }

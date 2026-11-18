@@ -1,0 +1,20 @@
+.recent-links { width: min(100%, var(--recent-width, 500px)); min-width: 0; background: #111724; border: 1px solid #2c3a52; border-radius: 20px; padding: 20px; color: #f5f7fc; }
+.recent-links[hidden] { display: none; }
+.recent-links h2 { margin: 0 0 6px; font-size: 18px; line-height: 1.5; }
+.recent-links h2 small { display: block; color: #9aa9c0; font-size: 13px; font-weight: 500; }
+
+.recent-item { padding: 14px 0; border-top: 1px solid #2c3a52; }
+.recent-item:first-of-type { margin-top: 10px; }
+.recent-name { margin: 0; font-size: 15px; font-weight: 600; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-status { margin: 3px 0 10px; color: #9aa9c0; font-size: 13px; line-height: 1.6; }
+
+.recent-actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.recent-btn { display: flex; align-items: center; justify-content: center; min-width: 0; min-height: 44px; padding: 0 6px; border: 1px solid #35445e; border-radius: 10px; background: #1d2a40; color: #e6edf9; font: inherit; font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer; touch-action: manipulation; }
+.recent-btn:hover { background: #2a3a55; }
+.recent-btn:focus-visible { outline: 3px solid #79a8ff; outline-offset: 2px; }
+.recent-btn:disabled { cursor: wait; opacity: .6; }
+.recent-danger { border-color: #773540; background: #3a1f27; color: #ffced5; }
+.recent-danger:hover { background: #49232b; }
+
+.recent-qr { display: block; width: 180px; height: 180px; margin: 14px auto 0; padding: 8px; border-radius: 12px; background: #fff; }
+.recent-qr[hidden] { display: none; }

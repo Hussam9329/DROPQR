@@ -694,6 +694,75 @@ test('secret text: guessing through the delete step counts too', async () => {
   assert.equal((await r.json()).attemptsLeft, 9);
 });
 
+test('recent links: a saved HTML link reports its status and QR code', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const { body, id } = await htmlLink({ expiry: '1h' });
+  const plain = await json('GET', `/api/html/${id}`);
+  assert.equal(plain.headers.get('cache-control'), 'no-store');
+  const meta = await plain.json();
+  assert.equal(meta.path, body.path);
+  assert.equal(meta.qrPng, undefined);
+  const shared = await (await json('GET', `/api/html/${id}?share=1`)).json();
+  assert.ok(shared.url.endsWith(body.path));
+  assert.match(shared.qrPng, /^data:image\/png;base64,/);
+  await pg.query("UPDATE pages SET expires_at = now() - interval '1 second' WHERE id = $1", [id]);
+  assert.equal((await json('GET', `/api/html/${id}`)).status, 410);
+  assert.equal((await json('GET', '/api/html/not-a-page')).status, 404);
+});
+
+test('recent links: only the uploader can delete an HTML link, and storage goes first', async () => {
+  await pg.query('DELETE FROM usage_counters');
+  const { body, id, uploadId } = await htmlLink();
+  const [{ pathname }] = (await pg.query('SELECT pathname FROM pages WHERE id = $1', [id])).rows;
+  assert.equal((await json('DELETE', `/api/html/${id}`)).status, 403);
+  assert.equal((await json('DELETE', `/api/html/${id}`, null, { 'x-upload-id': crypto.randomUUID() })).status, 403);
+  assert.equal((await fetch(base() + body.path)).status, 200);
+
+  blobFailures.del = true;
+  assert.equal((await json('DELETE', `/api/html/${id}`, null, { 'x-upload-id': uploadId })).status, 500);
+  assert.equal((await pg.query('SELECT 1 FROM pages WHERE id = $1', [id])).rows.length, 1);
+  blobFailures.del = false;
+
+  assert.equal((await json('DELETE', `/api/html/${id}`, null, { 'x-upload-id': uploadId })).status, 200);
+  assert.equal(blobs.has(pathname), false);
+  assert.equal((await pg.query('SELECT 1 FROM pages WHERE id = $1', [id])).rows.length, 0);
+  assert.equal((await fetch(base() + body.path)).status, 404);
+  assert.equal((await json('DELETE', `/api/html/${id}`, null, { 'x-upload-id': uploadId })).status, 404);
+});
+
+test('recent links: checking a secret text never uses it up', async () => {
+  const { body } = await secretText();
+  for (let i = 0; i < 3; i++) assert.equal((await json('GET', `/api/texts/${body.id}`, null, textIp)).status, 200);
+  const shared = await (await json('GET', `/api/texts/${body.id}?share=1`, null, textIp)).json();
+  assert.ok(shared.url.endsWith(`/t/${body.id}`));
+  assert.match(shared.qrPng, /^data:image\/png;base64,/);
+  assert.equal(shared.ciphertext, undefined);
+  assert.equal(shared.deleteToken, undefined);
+  const [row] = (await pg.query('SELECT opened_at, wrong_attempts FROM texts WHERE id = $1', [body.id])).rows;
+  assert.equal(row.opened_at, null);
+  assert.equal(row.wrong_attempts, 0);
+  assert.equal((await openText(body.id)).status, 200);
+});
+
+test('recent links: only the writer can delete a secret text, and the token cannot open it', async () => {
+  const { body } = await secretText({ burn: false });
+  assert.ok(body.deleteToken.length >= 32);
+  assert.equal((await json('DELETE', `/api/texts/${body.id}`, null, textIp)).status, 403);
+  assert.equal((await json('DELETE', `/api/texts/${body.id}`, null, { ...textIp, 'x-delete-token': 'wrong' })).status, 403);
+  assert.equal((await openText(body.id, body.deleteToken)).status, 403);
+  assert.equal((await json('DELETE', `/api/texts/${body.id}`, null, { ...textIp, 'x-delete-token': body.deleteToken })).status, 200);
+  assert.equal((await pg.query('SELECT 1 FROM texts WHERE id = $1', [body.id])).rows.length, 0);
+  assert.equal((await openText(body.id)).status, 404);
+  assert.equal((await json('DELETE', `/api/texts/${body.id}`, null, { ...textIp, 'x-delete-token': body.deleteToken })).status, 404);
+});
+
+test('recent links: a text made before delete tokens can only expire', async () => {
+  const { body } = await secretText();
+  await pg.query('UPDATE texts SET delete_token = NULL WHERE id = $1', [body.id]);
+  assert.equal((await json('DELETE', `/api/texts/${body.id}`, null, { ...textIp, 'x-delete-token': '' })).status, 403);
+  assert.equal((await pg.query('SELECT 1 FROM texts WHERE id = $1', [body.id])).rows.length, 1);
+});
+
 test('secret text: pages are strict and carry no secret', async () => {
   const { body } = await secretText();
   const r = await fetch(`${base()}/t/${body.id}`);
